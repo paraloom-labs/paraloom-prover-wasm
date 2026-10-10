@@ -9,9 +9,12 @@ use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalDeserialize;
 
-use paraloom_prover_wasm::{prove_transact, v3_note_commitment, v3_note_pubkey};
+use paraloom_prover_wasm::{
+    mint_to_asset, prove_transact, v3_note_commitment, v3_note_commitment_asset, v3_note_pubkey,
+};
 
 const KEYS_DIR: &str = "../paraloom-core/keys";
+const NATIVE_SOL_ASSET: [u8; 32] = [0u8; 32];
 
 fn fr_to_le(f: &Fr) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -111,6 +114,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&NATIVE_SOL_ASSET),
         &inputs,
         &outputs,
     )
@@ -246,6 +250,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&NATIVE_SOL_ASSET),
         &inputs,
         &outputs,
     );
@@ -254,4 +259,38 @@ fn v3_merkle_path_output_proves_membership() {
         "a v3_merkle_path path must prove membership: {:?}",
         res.err()
     );
+}
+
+/// SPL token commitments match between client derivation and circom Poseidon,
+/// and `mint_to_asset` produces the expected domain-separated asset id (#779).
+#[test]
+fn spl_asset_commitment_and_mint_derivation() {
+    use paraloom_prover_wasm::privacy::poseidon_circom::v3_commit;
+
+    let mint = [42u8; 32];
+    let asset_hex = mint_to_asset(&hx(&mint)).expect("mint_to_asset");
+    assert_ne!(
+        asset_hex,
+        hx(&NATIVE_SOL_ASSET),
+        "SPL asset id must not equal native SOL asset"
+    );
+
+    let pk_hex = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(55u64)))).unwrap();
+    let blinding_hex = hx(&fr_to_le(&Fr::from(99u64)));
+
+    let client_commit_hex = v3_note_commitment_asset(
+        2500,
+        &pk_hex,
+        &blinding_hex,
+        &asset_hex,
+    )
+    .expect("v3_note_commitment_asset");
+
+    let expected_commit = v3_commit(
+        Fr::from(2500u64),
+        Fr::from_le_bytes_mod_order(&hex::decode(&pk_hex).unwrap()),
+        Fr::from(99u64),
+        Fr::from_le_bytes_mod_order(&hex::decode(&asset_hex).unwrap()),
+    );
+    assert_eq!(client_commit_hex, hx(&fr_to_le(&expected_commit)));
 }

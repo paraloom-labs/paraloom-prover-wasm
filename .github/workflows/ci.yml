@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout paraloom-prover-wasm
+        uses: actions/checkout@v4
+        with:
+          path: paraloom-prover-wasm
+
+      - name: Checkout paraloom-core
+        uses: actions/checkout@v4
+        with:
+          repository: paraloom-labs/paraloom-core
+          path: paraloom-core
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            paraloom-prover-wasm/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('paraloom-prover-wasm/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check compilation
+        working-directory: paraloom-prover-wasm
+        run: cargo check --verbose
+
+      - name: Run native smoke tests
+        working-directory: paraloom-prover-wasm
+        run: cargo test --verbose

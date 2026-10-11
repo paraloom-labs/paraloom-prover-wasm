@@ -445,6 +445,76 @@ pub fn v3_note_commitment_asset(
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
 
+/// Derive the v3 spend signature `Poseidon3(privkey, commitment, leaf_index)` (circom Poseidon).
+/// Binds the note's private key and tree leaf position to the spend authorization.
+#[wasm_bindgen]
+pub fn v3_note_signature(
+    privkey_hex: &str,
+    commitment_hex: &str,
+    leaf_index: u64,
+) -> Result<String, JsValue> {
+    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let commitment = Fr::from_le_bytes_mod_order(&hex32(commitment_hex)?);
+    let sig = v3_signature(sk, commitment, Fr::from(leaf_index));
+    Ok(hex::encode(fr_to_le_bytes_32(sig)))
+}
+
+/// Derive the v3 note nullifier `Poseidon3(commitment, leaf_index, signature)`
+/// from a known note commitment, spend key, and tree leaf position.
+#[wasm_bindgen]
+pub fn v3_nullifier_from_commitment(
+    commitment_hex: &str,
+    privkey_hex: &str,
+    leaf_index: u64,
+) -> Result<String, JsValue> {
+    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let commitment = Fr::from_le_bytes_mod_order(&hex32(commitment_hex)?);
+    let sig = v3_signature(sk, commitment, Fr::from(leaf_index));
+    let nf = v3_nullifier(commitment, Fr::from(leaf_index), sig);
+    Ok(hex::encode(fr_to_le_bytes_32(nf)))
+}
+
+/// Derive the v3 note nullifier `Poseidon3(commitment, leaf_index, signature)`
+/// from raw note parameters `(amount, privkey, blinding, asset_id)` and tree position.
+/// Allows clients to query on-chain nullifier accounts to determine note spent status
+/// without generating a Groth16 proof.
+#[wasm_bindgen]
+pub fn v3_note_nullifier(
+    amount: u64,
+    privkey_hex: &str,
+    blinding_hex: &str,
+    asset_id_hex: &str,
+    leaf_index: u64,
+) -> Result<String, JsValue> {
+    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let c = v3_commit(
+        Fr::from(amount),
+        v3_pubkey(sk),
+        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+    );
+    let sig = v3_signature(sk, c, Fr::from(leaf_index));
+    let nf = v3_nullifier(c, Fr::from(leaf_index), sig);
+    Ok(hex::encode(fr_to_le_bytes_32(nf)))
+}
+
+/// Derive the v3 note nullifier for native SOL notes (where asset_id is 0).
+#[wasm_bindgen]
+pub fn v3_note_nullifier_native(
+    amount: u64,
+    privkey_hex: &str,
+    blinding_hex: &str,
+    leaf_index: u64,
+) -> Result<String, JsValue> {
+    v3_note_nullifier(
+        amount,
+        privkey_hex,
+        blinding_hex,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        leaf_index,
+    )
+}
+
 /// An input note being spent by `prove_transact`. `path_hex` is the 32-entry
 /// sibling list from the tree (level 0 first); the left/right direction at
 /// each level comes from the bits of `leaf_index`, so no direction flags are

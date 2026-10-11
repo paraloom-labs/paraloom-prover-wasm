@@ -9,9 +9,13 @@ use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalDeserialize;
 
-use paraloom_prover_wasm::{prove_transact, v3_note_commitment, v3_note_pubkey};
+use paraloom_prover_wasm::{
+    prove_transact, v3_note_commitment, v3_note_nullifier, v3_note_nullifier_native,
+    v3_note_pubkey, v3_note_signature, v3_nullifier_from_commitment,
+};
 
 const KEYS_DIR: &str = "../paraloom-core/keys";
+const NATIVE_SOL_ASSET: [u8; 32] = [0u8; 32];
 
 fn fr_to_le(f: &Fr) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -111,6 +115,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&NATIVE_SOL_ASSET),
         &inputs,
         &outputs,
     )
@@ -246,6 +251,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&NATIVE_SOL_ASSET),
         &inputs,
         &outputs,
     );
@@ -255,3 +261,53 @@ fn v3_merkle_path_output_proves_membership() {
         res.err()
     );
 }
+
+/// Verify that client-side nullifier and spend signature derivations match
+/// circom Poseidon exactly, without needing Groth16 proving keys.
+#[test]
+fn v3_nullifier_derivation_matches_circom_poseidon() {
+    use paraloom_prover_wasm::privacy::poseidon_circom::{
+        v3_commit, v3_nullifier, v3_pubkey, v3_signature,
+    };
+
+    let amount = 1000u64;
+    let privkey_fr = Fr::from(55u64);
+    let blinding_fr = Fr::from(77u64);
+    let asset_id_fr = Fr::from(0u64);
+    let leaf_index = 42u64;
+
+    let privkey_hex = hx(&fr_to_le(&privkey_fr));
+    let blinding_hex = hx(&fr_to_le(&blinding_fr));
+    let asset_id_hex = hx(&fr_to_le(&asset_id_fr));
+
+    // Direct circom poseidon computation
+    let expected_pubkey = v3_pubkey(privkey_fr);
+    let expected_commit = v3_commit(Fr::from(amount), expected_pubkey, blinding_fr, asset_id_fr);
+    let expected_sig = v3_signature(privkey_fr, expected_commit, Fr::from(leaf_index));
+    let expected_nf = v3_nullifier(expected_commit, Fr::from(leaf_index), expected_sig);
+    let expected_nf_hex = hx(&fr_to_le(&expected_nf));
+
+    let commit_hex = hx(&fr_to_le(&expected_commit));
+
+    // 1. Test signature helper
+    let sig_hex = v3_note_signature(&privkey_hex, &commit_hex, leaf_index).expect("signature");
+    assert_eq!(sig_hex, hx(&fr_to_le(&expected_sig)));
+
+    // 2. Test nullifier from known commitment
+    let nf_from_commit_hex =
+        v3_nullifier_from_commitment(&commit_hex, &privkey_hex, leaf_index).expect("nf from commit");
+    assert_eq!(nf_from_commit_hex, expected_nf_hex);
+
+    // 3. Test nullifier from raw parameters
+    let nf_from_raw_hex =
+        v3_note_nullifier(amount, &privkey_hex, &blinding_hex, &asset_id_hex, leaf_index)
+            .expect("nf from raw");
+    assert_eq!(nf_from_raw_hex, expected_nf_hex);
+
+    // 4. Test native nullifier helper
+    let nf_native_hex =
+        v3_note_nullifier_native(amount, &privkey_hex, &blinding_hex, leaf_index)
+            .expect("nf native");
+    assert_eq!(nf_native_hex, expected_nf_hex);
+}
+

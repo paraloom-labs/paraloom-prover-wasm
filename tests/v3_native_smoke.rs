@@ -9,9 +9,13 @@ use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalDeserialize;
 
-use paraloom_prover_wasm::{prove_transact, v3_note_commitment, v3_note_pubkey};
+use paraloom_prover_wasm::{
+    prove_transact, v3_empty_merkle_root, v3_merkle_path, v3_merkle_root, v3_note_commitment,
+    v3_note_pubkey,
+};
 
 const KEYS_DIR: &str = "../paraloom-core/keys";
+const NATIVE_SOL_ASSET: [u8; 32] = [0u8; 32];
 
 fn fr_to_le(f: &Fr) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -111,6 +115,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&NATIVE_SOL_ASSET),
         &inputs,
         &outputs,
     )
@@ -246,6 +251,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&NATIVE_SOL_ASSET),
         &inputs,
         &outputs,
     );
@@ -255,3 +261,35 @@ fn v3_merkle_path_output_proves_membership() {
         res.err()
     );
 }
+
+/// Verify that v3_merkle_root computes the exact same root as v3_merkle_path for non-empty trees,
+/// and returns the canonical empty-tree root matching v3_empty_merkle_root for empty trees.
+#[test]
+fn v3_merkle_root_matches_path_and_empty_tree() {
+    let empty_root = v3_empty_merkle_root();
+    assert_eq!(empty_root.len(), 64);
+
+    let empty_leaves_root = v3_merkle_root("[]").expect("empty leaves root");
+    assert_eq!(empty_leaves_root, empty_root);
+
+    // Single leaf tree
+    let leaf0 = hx(&fr_to_le(&Fr::from(12345u64)));
+    let single_leaf_json = format!(r#"["{leaf0}"]"#);
+    let path_res: serde_json::Value =
+        serde_json::from_str(&v3_merkle_path(&single_leaf_json, 0).expect("v3_merkle_path"))
+            .expect("json parse");
+    let path_root = path_res["root"].as_str().expect("root string");
+    let root_direct = v3_merkle_root(&single_leaf_json).expect("v3_merkle_root");
+    assert_eq!(root_direct, path_root);
+
+    // Multi-leaf tree
+    let leaf1 = hx(&fr_to_le(&Fr::from(67890u64)));
+    let multi_leaves_json = format!(r#"["{leaf0}", "{leaf1}"]"#);
+    let multi_path_res: serde_json::Value =
+        serde_json::from_str(&v3_merkle_path(&multi_leaves_json, 1).expect("v3_merkle_path"))
+            .expect("json parse");
+    let multi_path_root = multi_path_res["root"].as_str().expect("root string");
+    let multi_root_direct = v3_merkle_root(&multi_leaves_json).expect("v3_merkle_root");
+    assert_eq!(multi_root_direct, multi_path_root);
+}
+

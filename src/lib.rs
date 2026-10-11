@@ -689,3 +689,60 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         hex::encode(fr_to_le_bytes_32(root))
     ))
 }
+
+/// Return the initial v3 empty-tree Merkle root (depth 32 zero-leaf root), hex.
+#[wasm_bindgen]
+pub fn v3_empty_merkle_root() -> String {
+    use privacy::poseidon_circom::v3_merkle_pair;
+
+    let mut z = Fr::from(0u64);
+    for _ in 0..TX_LEVELS {
+        z = v3_merkle_pair(z, z);
+    }
+    hex::encode(fr_to_le_bytes_32(z))
+}
+
+/// Rebuild the v3 on-chain tree from its ordered leaf list and return the Merkle root.
+///
+/// Accepts a JSON array of 32-byte hex leaf commitments in append order (e.g. `[]` for an
+/// empty tree, which returns the empty-tree root). Allows wallets, indexers,
+/// and verifiers to compute or check the tree root without requiring a specific leaf index.
+///
+/// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
+/// Returns 32-byte hex Merkle root.
+#[wasm_bindgen]
+pub fn v3_merkle_root(leaves_json: &str) -> Result<String, JsValue> {
+    use privacy::poseidon_circom::v3_merkle_pair;
+
+    let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
+        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
+
+    // Zero-subtree hashes, as the on-chain tree pads with.
+    let mut zeros = vec![Fr::from(0u64)];
+    for k in 0..TX_LEVELS {
+        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+    }
+
+    if leaves_hex.is_empty() {
+        return Ok(hex::encode(fr_to_le_bytes_32(zeros[TX_LEVELS])));
+    }
+
+    let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
+    for l in &leaves_hex {
+        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+    }
+
+    for depth in 0..TX_LEVELS {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let l = pair[0];
+            let r = *pair.get(1).unwrap_or(&zeros[depth]);
+            next.push(v3_merkle_pair(l, r));
+        }
+        level = next;
+    }
+
+    let root = *level.first().unwrap_or(&zeros[TX_LEVELS]);
+    Ok(hex::encode(fr_to_le_bytes_32(root)))
+}
+

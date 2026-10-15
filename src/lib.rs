@@ -482,6 +482,91 @@ struct TransactOutputNote {
 ///
 /// Returns `{ nullifiers: [hex, hex], output_commitments: [hex, hex], proof }`
 /// — with `root`/`ext_amount`/`recipient`, exactly the transact-ingress body.
+/// Host-side validation of the transact witness, shared by `prove_transact`
+/// and tested directly (the wasm wrapper cannot be unit-tested natively
+/// because `JsValue` does not exist off wasm32).
+///
+/// Everything checked here is unsatisfiable in-circuit, but
+/// `ark_groth16::Groth16::prove` runs in `SynthesisMode::Prove` and never calls
+/// `cs.is_satisfied()`: it would spend seconds synthesizing an unsatisfiable
+/// circuit and hand back `Ok(proof)` for a cryptographically invalid proof.
+/// These checks turn that silent failure into an explicit `Err`.
+fn validate_transact_witness(
+    inputs: &[TransactInputNote],
+    outputs: &[TransactOutputNote],
+    ext_amount: i64,
+    root: &[u8; 32],
+    asset_id_hex: &str,
+) -> Result<(), String> {
+    // 1. 64-bit `leaf_index` vs the 32-bit `UInt32` in-circuit witness.
+    //    The host derives public nullifiers from the full u64; the circuit
+    //    truncates. Above u32::MAX the two diverge.
+    for inp in inputs {
+        if inp.leaf_index > u32::MAX as u64 {
+            return Err(format!(
+                "leaf_index {} exceeds 32-bit circuit width (max {})",
+                inp.leaf_index,
+                u32::MAX
+            ));
+        }
+    }
+
+    // 2. Value conservation, in i128 so two huge u64 amounts cannot overflow
+    //    past one another.
+    let in_sum: i128 = inputs.iter().map(|i| i.amount as i128).sum();
+    let out_sum: i128 = outputs.iter().map(|o| o.amount as i128).sum();
+    if in_sum + ext_amount as i128 != out_sum {
+        return Err(format!(
+            "unbalanced transact: inputs {in_sum} + ext_amount {ext_amount} != outputs {out_sum}"
+        ));
+    }
+
+    // 3. Merkle membership for every non-zero input note: it must fold, along
+    //    its own leaf_index bits, up to the root the proof commits to.
+    //    Zero-value padding notes skip membership in-circuit too.
+    let asset_bytes = hex32(asset_id_hex).map_err(|e| format!("bad asset_id_hex: {e:?}"))?;
+    let asset = Fr::from_le_bytes_mod_order(&asset_bytes);
+    for inp in inputs {
+        if inp.amount == 0 {
+            continue;
+        }
+        if inp.path_hex.len() != TX_LEVELS {
+            return Err(format!(
+                "input path must have {TX_LEVELS} siblings, got {}",
+                inp.path_hex.len()
+            ));
+        }
+        let privkey0 = hex32(&inp.privkey_hex).map_err(|e| format!("bad privkey_hex: {e:?}"))?;
+        let blinding0 = hex32(&inp.blinding_hex).map_err(|e| format!("bad blinding_hex: {e:?}"))?;
+        let sk0 = Fr::from_le_bytes_mod_order(&privkey0);
+        let leaf = v3_commit(
+            Fr::from(inp.amount),
+            v3_pubkey(sk0),
+            Fr::from_le_bytes_mod_order(&blinding0),
+            asset,
+        );
+
+        let mut node = leaf;
+        let mut idx = inp.leaf_index;
+        for sib in &inp.path_hex {
+            let sib_bytes = hex32(sib).map_err(|e| format!("bad path sibling: {e:?}"))?;
+            let sib_fr = Fr::from_le_bytes_mod_order(&sib_bytes);
+            node = if idx & 1 == 0 {
+                v3_merkle_pair(node, sib_fr)
+            } else {
+                v3_merkle_pair(sib_fr, node)
+            };
+            idx >>= 1;
+        }
+
+        if fr_to_le_bytes_32(node) != *root {
+            return Err("input note does not fold to root: merkle path or leaf_index is stale".to_string());
+        }
+    }
+
+    Ok(())
+}
+
 #[wasm_bindgen]
 pub fn prove_transact(
     proving_key: &[u8],
@@ -507,6 +592,9 @@ pub fn prove_transact(
     if inputs.len() != 2 || outputs.len() != 2 {
         return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
     }
+
+    validate_transact_witness(&inputs, &outputs, ext_amount, &root, asset_id_hex)
+        .map_err(|e| JsValue::from_str(&e))?;
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
@@ -688,4 +776,103 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod prove_transact_guard_tests {
+    use super::*;
+    use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_pubkey};
+
+    fn hx(b: &[u8; 32]) -> String {
+        hex::encode(b)
+    }
+
+    fn fr(f: Fr) -> [u8; 32] {
+        fr_to_le_bytes_32(f)
+    }
+
+    /// One 1000-value note at leaf 0 of an otherwise empty 32-level tree, plus
+    /// a zero-value padding note, and the root they sit under.
+    fn fixture() -> (String, [u8; 32], Vec<TransactInputNote>, Vec<TransactOutputNote>) {
+        let mut zeros = vec![Fr::from(0u64)];
+        for k in 0..32 {
+            zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+        }
+        let sk0 = Fr::from(51u64);
+        let bl0 = Fr::from(5u64);
+        let c0 = v3_commit(Fr::from(1000u64), v3_pubkey(sk0), bl0, Fr::from(0u64));
+        let mut root = c0;
+        for z in zeros.iter().take(32) {
+            root = v3_merkle_pair(root, *z);
+        }
+        let path_json = serde_json::to_string(
+            &zeros[..32].iter().map(|z| hx(&fr(*z))).collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let inputs: Vec<TransactInputNote> = serde_json::from_str(&format!(
+            r#"[
+              {{"amount":1000,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}},
+              {{"amount":0,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}}
+            ]"#,
+            hx(&fr(sk0)), hx(&fr(bl0)),
+            hx(&fr(Fr::from(52u64))), hx(&fr(Fr::from(6u64))),
+        ))
+        .unwrap();
+        let outputs: Vec<TransactOutputNote> = serde_json::from_str(&format!(
+            r#"[
+              {{"amount":600,"pubkey_hex":"{}","blinding_hex":"{}"}},
+              {{"amount":400,"pubkey_hex":"{}","blinding_hex":"{}"}}
+            ]"#,
+            hx(&fr(Fr::from(61u64))), hx(&fr(Fr::from(1u64))),
+            hx(&fr(Fr::from(62u64))), hx(&fr(Fr::from(2u64))),
+        ))
+        .unwrap();
+        (hx(&[0u8; 32]), fr(root), inputs, outputs)
+    }
+
+    #[test]
+    fn accepts_a_well_formed_witness() {
+        let (asset_hex, root, inputs, outputs) = fixture();
+        assert_eq!(
+            validate_transact_witness(&inputs, &outputs, 0, &root, &asset_hex),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_leaf_index_above_the_32bit_circuit_width() {
+        let (asset_hex, root, mut inputs, outputs) = fixture();
+        inputs[0].leaf_index = u32::MAX as u64 + 1;
+        let err = validate_transact_witness(&inputs, &outputs, -1000, &root, &asset_hex)
+            .expect_err("leaf_index above u32::MAX must be rejected");
+        assert!(err.contains("32-bit circuit width"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unbalanced_value_conservation() {
+        let (asset_hex, root, inputs, outputs) = fixture();
+        // inputs 1000, ext_amount -1, outputs 1000 -> 999 != 1000.
+        let err = validate_transact_witness(&inputs, &outputs, -1, &root, &asset_hex)
+            .expect_err("unbalanced transact must be rejected");
+        assert!(err.contains("unbalanced"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_merkle_path_that_does_not_fold_to_root() {
+        let (asset_hex, _root, inputs, outputs) = fixture();
+        let wrong_root = fr(Fr::from(0xAAu64));
+        let err = validate_transact_witness(&inputs, &outputs, 0, &wrong_root, &asset_hex)
+            .expect_err("a stale merkle path must be rejected");
+        assert!(err.contains("fold to root"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_wrong_length_path_even_for_a_nonzero_note() {
+        let (asset_hex, root, mut inputs, outputs) = fixture();
+        inputs[0].path_hex.pop();
+        let err = validate_transact_witness(&inputs, &outputs, 0, &root, &asset_hex)
+            .expect_err("a short path must be rejected");
+        assert!(err.contains("TX_LEVELS") || err.contains("siblings"), "got: {err}");
+    }
 }

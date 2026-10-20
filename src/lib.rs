@@ -22,8 +22,8 @@ use serde::Deserialize;
 
 use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
 use privacy::poseidon::{
-    poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
-    poseidon_signature,
+    poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier_spend,
+    poseidon_pubkey, poseidon_signature,
 };
 use sha2::{Digest, Sha256};
 
@@ -35,14 +35,35 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
+#[cfg(target_arch = "wasm32")]
+fn js_err(msg: &str) -> JsValue {
+    JsValue::from_str(msg)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_err(_msg: &str) -> JsValue {
+    JsValue::NULL
+}
+
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+    let b = hex::decode(s.trim()).map_err(|e| js_err(&format!("bad hex: {e}")))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err(js_err("expected 32-byte hex"));
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+fn hex32_canonical(s: &str) -> Result<[u8; 32], JsValue> {
+    let b = hex32(s)?;
+    let reduced = Fr::from_le_bytes_mod_order(&b);
+    if fr_to_le_bytes_32(reduced) != b {
+        return Err(js_err(
+            "non-canonical BN254 field element (>= scalar field modulus)",
+        ));
+    }
+    Ok(b)
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -53,8 +74,8 @@ pub fn note_commitment(
     randomness_hex: &str,
     recipient_hex: &str,
 ) -> Result<String, JsValue> {
-    let randomness = hex32(randomness_hex)?;
-    let recipient = hex32(recipient_hex)?;
+    let randomness = hex32_canonical(randomness_hex)?;
+    let recipient = hex32_canonical(recipient_hex)?;
     let c = poseidon_commit(
         Fr::from(amount),
         Fr::from_le_bytes_mod_order(&randomness),
@@ -100,8 +121,8 @@ pub fn note_commitment_v2(
     let c = poseidon_commit_spend(
         Fr::from(amount),
         poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32_canonical(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32_canonical(asset_id_hex)?),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -112,17 +133,24 @@ fn rng_from_entropy() -> StdRng {
     StdRng::from_seed(seed)
 }
 
+/// Maximum supported v2 Merkle path depth so `1u64 << level` never overflows
+/// `u64` or diverges from the in-circuit field accumulator.
+const MAX_V2_MERKLE_DEPTH: usize = 63;
+
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
 fn merkle_path_from(
     path_hex: &[String],
     indices: &[bool],
 ) -> Result<Vec<([u8; 32], bool)>, JsValue> {
     if path_hex.len() != indices.len() {
-        return Err(JsValue::from_str("path and indices length mismatch"));
+        return Err(js_err("path and indices length mismatch"));
+    }
+    if path_hex.is_empty() || path_hex.len() > MAX_V2_MERKLE_DEPTH {
+        return Err(js_err("merkle path depth must be in 1..=63"));
     }
     let mut path = Vec::with_capacity(path_hex.len());
     for (h, dir) in path_hex.iter().zip(indices) {
-        path.push((hex32(h)?, *dir));
+        path.push((hex32_canonical(h)?, *dir));
     }
     Ok(path)
 }
@@ -130,15 +158,36 @@ fn merkle_path_from(
 /// Leaf index from a path's direction bits: a level adds `2^level` when the
 /// current node is the right child (`is_left == false`), matching the spend-key
 /// circuits' in-circuit derivation. The spend-key nullifier binds this index, so
-/// the prover must compute it the same way.
-fn leaf_index_from(indices: &[bool]) -> u64 {
+/// the prover must compute it the same way without shift overflow.
+fn leaf_index_from(indices: &[bool]) -> Result<u64, JsValue> {
+    if indices.is_empty() || indices.len() > MAX_V2_MERKLE_DEPTH {
+        return Err(js_err("merkle indices length must be in 1..=63"));
+    }
     let mut idx = 0u64;
     for (level, is_left) in indices.iter().enumerate() {
         if !is_left {
-            idx += 1u64 << level;
+            let bit = 1u64
+                .checked_shl(level as u32)
+                .ok_or_else(|| js_err("leaf_index shift overflow"))?;
+            idx = idx
+                .checked_add(bit)
+                .ok_or_else(|| js_err("leaf_index addition overflow"))?;
         }
     }
-    idx
+    Ok(idx)
+}
+
+fn fold_v2_merkle_path(commitment: Fr, merkle_path: &[([u8; 32], bool)]) -> Fr {
+    let mut current = commitment;
+    for (sibling_bytes, is_left) in merkle_path {
+        let sibling = Fr::from_le_bytes_mod_order(sibling_bytes);
+        current = if *is_left {
+            poseidon_merkle_pair(current, sibling)
+        } else {
+            poseidon_merkle_pair(sibling, current)
+        };
+    }
+    current
 }
 
 /// Prove a spend-key withdrawal (circuit v2, #293).
@@ -173,19 +222,22 @@ pub fn prove_withdrawal_v2(
     path_hex_json: &str,
     indices_json: &str,
 ) -> Result<String, JsValue> {
-    let root = hex32(root_hex)?;
-    let blinding = hex32(blinding_hex)?;
+    if amount == 0 {
+        return Err(js_err("withdrawal amount must be greater than zero"));
+    }
+    let root = hex32_canonical(root_hex)?;
+    let blinding = hex32_canonical(blinding_hex)?;
     let privkey = hex32(privkey_hex)?;
-    let asset_id = hex32(asset_id_hex)?;
+    let asset_id = hex32_canonical(asset_id_hex)?;
     let dest_recipient = hex32(dest_recipient_hex)?;
 
     let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
-        .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad path json: {e}")))?;
     let indices: Vec<bool> = serde_json::from_str(indices_json)
-        .map_err(|e| JsValue::from_str(&format!("bad indices json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad indices json: {e}")))?;
     let merkle_path = merkle_path_from(&path_hex, &indices)?;
 
-    let leaf_index = leaf_index_from(&indices);
+    let leaf_index = leaf_index_from(&indices)?;
 
     let sk = Fr::from_le_bytes_mod_order(&privkey);
     let commitment_fr = poseidon_commit_spend(
@@ -194,6 +246,11 @@ pub fn prove_withdrawal_v2(
         Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&asset_id),
     );
+    let computed_root = fold_v2_merkle_path(commitment_fr, &merkle_path);
+    if fr_to_le_bytes_32(computed_root) != root {
+        return Err(js_err("input note merkle path does not fold to root"));
+    }
+
     let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
     let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
     let nullifier = fr_to_le_bytes_32(nullifier_fr);
@@ -218,15 +275,15 @@ pub fn prove_withdrawal_v2(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(&format!("serialize failed: {e}")))?;
 
     Ok(format!(
         "{{\"nullifier\":\"{}\",\"proof\":\"{}\"}}",
@@ -286,18 +343,24 @@ pub fn prove_transfer_v2(
     inputs_json: &str,
     outputs_json: &str,
 ) -> Result<String, JsValue> {
-    let root = hex32(root_hex)?;
-    let asset_id = hex32(asset_id_hex)?;
+    let root = hex32_canonical(root_hex)?;
+    let asset_id = hex32_canonical(asset_id_hex)?;
     let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
 
     let inputs: Vec<TransferInputV2> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransferOutputV2> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad outputs json: {e}")))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str(
+        return Err(js_err(
             "transfer requires exactly 2 inputs and 2 outputs",
         ));
+    }
+
+    let in_sum = (inputs[0].amount as u128) + (inputs[1].amount as u128);
+    let out_sum = (outputs[0].amount as u128) + (outputs[1].amount as u128);
+    if in_sum != out_sum {
+        return Err(js_err("transfer input sum must equal output sum"));
     }
 
     let mut nullifiers = Vec::with_capacity(2);
@@ -306,8 +369,10 @@ pub fn prove_transfer_v2(
     let mut input_privkeys = Vec::with_capacity(2);
     let mut input_paths = Vec::with_capacity(2);
     for inp in &inputs {
-        let blinding = hex32(&inp.blinding_hex)?;
+        let blinding = hex32_canonical(&inp.blinding_hex)?;
         let privkey = hex32(&inp.privkey_hex)?;
+        let merkle_path = merkle_path_from(&inp.path_hex, &inp.indices)?;
+        let leaf_index = leaf_index_from(&inp.indices)?;
         let sk = Fr::from_le_bytes_mod_order(&privkey);
         let commitment_fr = poseidon_commit_spend(
             Fr::from(inp.amount),
@@ -315,14 +380,21 @@ pub fn prove_transfer_v2(
             Fr::from_le_bytes_mod_order(&blinding),
             asset_fr,
         );
-        let leaf_index = leaf_index_from(&inp.indices);
+        let computed_root = fold_v2_merkle_path(commitment_fr, &merkle_path);
+        if fr_to_le_bytes_32(computed_root) != root {
+            return Err(js_err("transfer input merkle path does not fold to root"));
+        }
         let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
         let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
         nullifiers.push(fr_to_le_bytes_32(nullifier_fr));
         input_values.push(inp.amount);
         input_blindings.push(blinding);
         input_privkeys.push(privkey);
-        input_paths.push(merkle_path_from(&inp.path_hex, &inp.indices)?);
+        input_paths.push(merkle_path);
+    }
+
+    if nullifiers[0] == nullifiers[1] {
+        return Err(js_err("duplicate input nullifier in transfer"));
     }
 
     let mut output_commitments = Vec::with_capacity(2);
@@ -330,8 +402,8 @@ pub fn prove_transfer_v2(
     let mut output_blindings = Vec::with_capacity(2);
     let mut output_pubkeys = Vec::with_capacity(2);
     for out in &outputs {
-        let blinding = hex32(&out.blinding_hex)?;
-        let pubkey = hex32(&out.pubkey_hex)?;
+        let blinding = hex32_canonical(&out.blinding_hex)?;
+        let pubkey = hex32_canonical(&out.pubkey_hex)?;
         let commitment_fr = poseidon_commit_spend(
             Fr::from(out.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -342,6 +414,10 @@ pub fn prove_transfer_v2(
         output_values.push(out.amount);
         output_blindings.push(blinding);
         output_pubkeys.push(pubkey);
+    }
+
+    if output_commitments[0] == output_commitments[1] {
+        return Err(js_err("duplicate output commitment in transfer"));
     }
 
     let circuit = TransferCircuitV2::with_witness(
@@ -359,15 +435,15 @@ pub fn prove_transfer_v2(
     );
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(&format!("serialize failed: {e}")))?;
 
     let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
@@ -418,8 +494,8 @@ pub fn v3_note_commitment(
 ) -> Result<String, JsValue> {
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32_canonical(pubkey_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32_canonical(blinding_hex)?),
         Fr::from(0u64), // NATIVE_SOL
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -438,9 +514,9 @@ pub fn v3_note_commitment_asset(
 ) -> Result<String, JsValue> {
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32_canonical(pubkey_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32_canonical(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&hex32_canonical(asset_id_hex)?),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -493,24 +569,33 @@ pub fn prove_transact(
     outputs_json: &str,
 ) -> Result<String, JsValue> {
     if ext_amount > 0 {
-        return Err(JsValue::from_str(
+        return Err(js_err(
             "positive ext_amount: deposits go through deposit_note, not transact",
         ));
     }
-    let root = hex32(root_hex)?;
+    let root = hex32_canonical(root_hex)?;
     let recipient = hex32(recipient_hex)?;
 
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad outputs json: {e}")))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
+        return Err(js_err("transact is fixed 2-in/2-out"));
+    }
+
+    let in_total = (inputs[0].amount as i128) + (inputs[1].amount as i128);
+    let out_total = (outputs[0].amount as i128) + (outputs[1].amount as i128);
+    if in_total + (ext_amount as i128) != out_total {
+        return Err(js_err(
+            "value conservation violated: sum(inputs) + ext_amount != sum(outputs)",
+        ));
     }
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let asset = Fr::from_le_bytes_mod_order(&hex32_canonical(asset_id_hex)?);
+    let root_fr = Fr::from_le_bytes_mod_order(&root);
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
@@ -519,17 +604,20 @@ pub fn prove_transact(
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
     for inp in &inputs {
+        if inp.leaf_index > u32::MAX as u64 {
+            return Err(js_err("input leaf_index exceeds 32-bit tree depth"));
+        }
         let privkey = hex32(&inp.privkey_hex)?;
-        let blinding = hex32(&inp.blinding_hex)?;
+        let blinding = hex32_canonical(&inp.blinding_hex)?;
         if inp.path_hex.len() != TX_LEVELS {
-            return Err(JsValue::from_str(&format!(
+            return Err(js_err(&format!(
                 "input path must have {TX_LEVELS} siblings, got {}",
                 inp.path_hex.len()
             )));
         }
         let mut path = Vec::with_capacity(TX_LEVELS);
         for sib in &inp.path_hex {
-            path.push(hex32(sib)?);
+            path.push(hex32_canonical(sib)?);
         }
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
@@ -539,6 +627,23 @@ pub fn prove_transact(
             Fr::from_le_bytes_mod_order(&blinding),
             asset,
         );
+        if inp.amount > 0 {
+            let mut cur = c;
+            for (lvl, sib_bytes) in path.iter().enumerate() {
+                let sib_fr = Fr::from_le_bytes_mod_order(sib_bytes);
+                let is_right = ((inp.leaf_index >> lvl) & 1) == 1;
+                cur = if is_right {
+                    v3_merkle_pair(sib_fr, cur)
+                } else {
+                    v3_merkle_pair(cur, sib_fr)
+                };
+            }
+            if cur != root_fr {
+                return Err(js_err(
+                    "non-zero input note merkle path does not fold to root",
+                ));
+            }
+        }
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
         nullifiers.push(fr_to_le_bytes_32(nf));
@@ -550,13 +655,17 @@ pub fn prove_transact(
         in_paths.push(Some(path));
     }
 
+    if nullifiers[0] == nullifiers[1] {
+        return Err(js_err("duplicate input nullifier"));
+    }
+
     let mut out_amounts = Vec::new();
     let mut out_pubkeys = Vec::new();
     let mut out_blindings = Vec::new();
     let mut output_commitments = Vec::new();
     for outp in &outputs {
-        let pubkey = hex32(&outp.pubkey_hex)?;
-        let blinding = hex32(&outp.blinding_hex)?;
+        let pubkey = hex32_canonical(&outp.pubkey_hex)?;
+        let blinding = hex32_canonical(&outp.blinding_hex)?;
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -603,15 +712,15 @@ pub fn prove_transact(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(&format!("serialize failed: {e}")))?;
 
     // The L2 carries `tag(1) || body`. Nodes split the envelope and reject an
     // unknown suite rather than assuming the one they happen to embed, so an
@@ -647,13 +756,13 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
     use privacy::poseidon_circom::v3_merkle_pair;
 
     let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
-        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad leaves json: {e}")))?;
     if (leaf_index as usize) >= leaves_hex.len() {
-        return Err(JsValue::from_str("leaf_index out of range"));
+        return Err(js_err("leaf_index out of range"));
     }
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+        level.push(Fr::from_le_bytes_mod_order(&hex32_canonical(l)?));
     }
 
     // Zero-subtree hashes, as the on-chain tree pads with.
@@ -689,3 +798,174 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         hex::encode(fr_to_le_bytes_32(root))
     ))
 }
+
+#[cfg(test)]
+mod v2_prover_guard_tests {
+    use super::*;
+
+    fn hx(b: &[u8; 32]) -> String {
+        hex::encode(b)
+    }
+
+    #[test]
+    fn leaf_index_from_rejects_empty_and_shift_overflow_depths() {
+        assert!(
+            leaf_index_from(&[]).is_err(),
+            "empty Merkle direction bits must be rejected"
+        );
+        let sixty_four_right_bits = vec![false; 64];
+        assert!(
+            leaf_index_from(&sixty_four_right_bits).is_err(),
+            "64-level path must return Err instead of panicking on 1u64 << 64"
+        );
+        // Valid 20-level path where bits 0 and 2 are right-children (index = 1 + 4 = 5).
+        let mut bits = vec![true; 20];
+        bits[0] = false;
+        bits[2] = false;
+        assert_eq!(leaf_index_from(&bits).unwrap(), 5);
+    }
+
+    #[test]
+    fn prove_withdrawal_v2_rejects_zero_amount_bad_depth_wrong_root_and_non_canonical_fields() {
+        let z = hx(&[0u8; 32]);
+        let sk = hx(&fr_to_le_bytes_32(Fr::from(7u64)));
+        let bl = hx(&fr_to_le_bytes_32(Fr::from(11u64)));
+        let path_20 = serde_json::to_string(&vec![z.clone(); 20]).unwrap();
+        let idx_20 = serde_json::to_string(&vec![true; 20]).unwrap();
+
+        // 1. Zero withdrawal amount must be rejected before circuit synthesis.
+        assert!(
+            prove_withdrawal_v2(&[], &z, 0, &bl, &sk, &z, &z, &path_20, &idx_20).is_err(),
+            "zero withdrawal amount must be rejected"
+        );
+
+        // 2. Empty or >=64-level Merkle path must be rejected without panicking.
+        assert!(
+            prove_withdrawal_v2(&[], &z, 100, &bl, &sk, &z, &z, "[]", "[]").is_err(),
+            "empty Merkle path must be rejected"
+        );
+        let path_64 = serde_json::to_string(&vec![z.clone(); 64]).unwrap();
+        let idx_64 = serde_json::to_string(&vec![false; 64]).unwrap();
+        assert!(
+            prove_withdrawal_v2(&[], &z, 100, &bl, &sk, &z, &z, &path_64, &idx_64).is_err(),
+            "64-level Merkle path must be rejected without shift overflow"
+        );
+
+        // 3. Stale/mismatched root must be rejected before Groth16 proving.
+        assert!(
+            prove_withdrawal_v2(&[], &z, 100, &bl, &sk, &z, &z, &path_20, &idx_20).is_err(),
+            "mismatched Merkle root in prove_withdrawal_v2 must be rejected"
+        );
+
+        // 4. Non-canonical BN254 field elements (>= Fr::MODULUS) must be rejected.
+        let non_canonical = hx(&[0xFFu8; 32]);
+        assert!(
+            note_commitment(100, &non_canonical, &z).is_err(),
+            "note_commitment must reject non-canonical randomness"
+        );
+        assert!(
+            note_commitment_v2(100, &sk, &non_canonical, &z).is_err(),
+            "note_commitment_v2 must reject non-canonical blinding"
+        );
+        assert!(
+            prove_withdrawal_v2(&[], &non_canonical, 100, &bl, &sk, &z, &z, &path_20, &idx_20)
+                .is_err(),
+            "prove_withdrawal_v2 must reject non-canonical root"
+        );
+    }
+
+    #[test]
+    fn prove_transfer_v2_rejects_unbalanced_wrong_root_and_duplicate_nullifiers_or_commitments() {
+        let z = hx(&[0u8; 32]);
+        let sk0_fr = Fr::from(21u64);
+        let sk1_fr = Fr::from(22u64);
+        let bl0_fr = Fr::from(31u64);
+        let bl1_fr = Fr::from(32u64);
+        let sk0 = hx(&fr_to_le_bytes_32(sk0_fr));
+        let sk1 = hx(&fr_to_le_bytes_32(sk1_fr));
+        let bl0 = hx(&fr_to_le_bytes_32(bl0_fr));
+        let bl1 = hx(&fr_to_le_bytes_32(bl1_fr));
+        let pk_out0 = spend_pubkey(&sk0).unwrap();
+        let pk_out1 = spend_pubkey(&sk1).unwrap();
+
+        // Build a valid 2-leaf depth-1 v2 tree with leaf0 (amount=600) and leaf1 (amount=400).
+        let c0 = poseidon_commit_spend(
+            Fr::from(600u64),
+            poseidon_pubkey(sk0_fr),
+            bl0_fr,
+            Fr::from(0u64),
+        );
+        let c1 = poseidon_commit_spend(
+            Fr::from(400u64),
+            poseidon_pubkey(sk1_fr),
+            bl1_fr,
+            Fr::from(0u64),
+        );
+        let root_fr = poseidon_merkle_pair(c0, c1);
+        let root_hex = hx(&fr_to_le_bytes_32(root_fr));
+        let c0_hex = hx(&fr_to_le_bytes_32(c0));
+        let c1_hex = hx(&fr_to_le_bytes_32(c1));
+
+        let valid_inputs = format!(
+            r#"[
+              {{"amount":600,"privkey_hex":"{sk0}","blinding_hex":"{bl0}","path_hex":["{c1_hex}"],"indices":[true]}},
+              {{"amount":400,"privkey_hex":"{sk1}","blinding_hex":"{bl1}","path_hex":["{c0_hex}"],"indices":[false]}}
+            ]"#
+        );
+
+        // 1. Unbalanced transfer (600 + 400 != 700 + 400) must be rejected.
+        let unbalanced_outputs = format!(
+            r#"[
+              {{"amount":700,"pubkey_hex":"{pk_out0}","blinding_hex":"{bl0}"}},
+              {{"amount":400,"pubkey_hex":"{pk_out1}","blinding_hex":"{bl1}"}}
+            ]"#
+        );
+        assert!(
+            prove_transfer_v2(&[], &root_hex, &z, &valid_inputs, &unbalanced_outputs).is_err(),
+            "unbalanced transfer_v2 amounts must be rejected"
+        );
+
+        // 2. Wrong Merkle root must be rejected before circuit synthesis.
+        let balanced_outputs = format!(
+            r#"[
+              {{"amount":700,"pubkey_hex":"{pk_out0}","blinding_hex":"{bl0}"}},
+              {{"amount":300,"pubkey_hex":"{pk_out1}","blinding_hex":"{bl1}"}}
+            ]"#
+        );
+        assert!(
+            prove_transfer_v2(&[], &z, &z, &valid_inputs, &balanced_outputs).is_err(),
+            "wrong Merkle root in prove_transfer_v2 must be rejected"
+        );
+
+        // 3. Duplicate input nullifiers (same note spent twice) must be rejected.
+        let dup_inputs = format!(
+            r#"[
+              {{"amount":600,"privkey_hex":"{sk0}","blinding_hex":"{bl0}","path_hex":["{c1_hex}"],"indices":[true]}},
+              {{"amount":600,"privkey_hex":"{sk0}","blinding_hex":"{bl0}","path_hex":["{c1_hex}"],"indices":[true]}}
+            ]"#
+        );
+        let outputs_1200 = format!(
+            r#"[
+              {{"amount":700,"pubkey_hex":"{pk_out0}","blinding_hex":"{bl0}"}},
+              {{"amount":500,"pubkey_hex":"{pk_out1}","blinding_hex":"{bl1}"}}
+            ]"#
+        );
+        assert!(
+            prove_transfer_v2(&[], &root_hex, &z, &dup_inputs, &outputs_1200).is_err(),
+            "duplicate input nullifiers in prove_transfer_v2 must be rejected"
+        );
+
+        // 4. Duplicate output commitments (identical output notes) must be rejected.
+        let dup_outputs = format!(
+            r#"[
+              {{"amount":500,"pubkey_hex":"{pk_out0}","blinding_hex":"{bl0}"}},
+              {{"amount":500,"pubkey_hex":"{pk_out0}","blinding_hex":"{bl0}"}}
+            ]"#
+        );
+        assert!(
+            prove_transfer_v2(&[], &root_hex, &z, &valid_inputs, &dup_outputs).is_err(),
+            "duplicate output commitments in prove_transfer_v2 must be rejected"
+        );
+    }
+}
+

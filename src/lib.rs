@@ -643,17 +643,30 @@ pub fn prove_transact(
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
-pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
+pub fn v3_merkle_path_impl(leaves_json: &str, leaf_index: u32) -> Result<String, String> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
     let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
-        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
+        .map_err(|e| format!("bad leaves json: {e}"))?;
+    if leaves_hex.is_empty() {
+        return Err("leaves list cannot be empty".to_string());
+    }
+    const MAX_LEAVES: usize = 1usize << TX_LEVELS; // 2^32 capacity
+    if leaves_hex.len() > MAX_LEAVES {
+        return Err(format!(
+            "tree capacity exceeded: maximum {MAX_LEAVES} leaves supported"
+        ));
+    }
     if (leaf_index as usize) >= leaves_hex.len() {
-        return Err(JsValue::from_str("leaf_index out of range"));
+        return Err("leaf_index out of range".to_string());
     }
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+        let b = hex::decode(l.trim()).map_err(|e| format!("bad hex: {e}"))?;
+        if b.len() != 32 {
+            return Err("expected 32-byte hex".to_string());
+        }
+        level.push(Fr::from_le_bytes_mod_order(&b));
     }
 
     // Zero-subtree hashes, as the on-chain tree pads with.
@@ -688,4 +701,38 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[wasm_bindgen]
+pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
+    v3_merkle_path_impl(leaves_json, leaf_index).map_err(|e| JsValue::from_str(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v3_merkle_path_rejects_empty_leaves_list() {
+        let err = v3_merkle_path_impl("[]", 0).expect_err("empty leaves must fail");
+        assert_eq!(err, "leaves list cannot be empty");
+    }
+
+    #[test]
+    fn v3_merkle_path_rejects_leaf_index_out_of_bounds() {
+        let leaves = serde_json::to_string(&[hex::encode([1u8; 32])]).unwrap();
+        let err = v3_merkle_path_impl(&leaves, 1).expect_err("out of bounds leaf_index must fail");
+        assert_eq!(err, "leaf_index out of range");
+    }
+
+    #[test]
+    fn v3_merkle_path_single_leaf_round_trips() {
+        let leaf = [42u8; 32];
+        let leaves = serde_json::to_string(&[hex::encode(leaf)]).unwrap();
+        let res_json = v3_merkle_path_impl(&leaves, 0).expect("single leaf path");
+        let v: serde_json::Value = serde_json::from_str(&res_json).unwrap();
+        let path = v["path"].as_array().unwrap();
+        assert_eq!(path.len(), TX_LEVELS);
+        assert!(!v["root"].as_str().unwrap().is_empty());
+    }
 }

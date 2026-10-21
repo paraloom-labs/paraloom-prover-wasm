@@ -644,16 +644,59 @@ pub fn prove_transact(
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
+    v3_merkle_path_impl(leaves_json, leaf_index).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Maximum number of leaves the fixed-depth tree can hold: `2^TX_LEVELS`.
+///
+/// Kept as a `u64` so the bound is expressible on 32-bit `wasm32` targets,
+/// where `1usize << TX_LEVELS` would overflow the shift width.
+pub(crate) const MAX_V3_LEAVES: u64 = 1u64 << TX_LEVELS;
+
+/// Validate a leaf count against the fixed tree capacity.
+fn check_leaf_capacity(len: usize) -> Result<(), String> {
+    if len as u64 > MAX_V3_LEAVES {
+        return Err(format!(
+            "tree capacity exceeded: {len} leaves > 2^{TX_LEVELS} ({MAX_V3_LEAVES})"
+        ));
+    }
+    Ok(())
+}
+
+/// Native (non-`wasm_bindgen`) core of [`v3_merkle_path`].
+///
+/// Split out so the tree rebuild can be unit-tested on the host target without
+/// a `wasm32` JS runtime. All validation lives here; the exported shim only
+/// converts the error string into a `JsValue`.
+pub(crate) fn v3_merkle_path_impl(leaves_json: &str, leaf_index: u32) -> Result<String, String> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
     let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
-        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
+        .map_err(|e| format!("bad leaves json: {e}"))?;
+
+    // A freshly deployed pool / reset epoch has no deposits yet. Reject that
+    // explicitly so callers can tell "empty tree" apart from an index
+    // overflow, instead of inferring it from "leaf_index out of range".
+    if leaves_hex.is_empty() {
+        return Err("leaves list cannot be empty".to_string());
+    }
+
+    // The circuit and the on-chain program are both fixed at `TX_LEVELS`
+    // (capacity `2^TX_LEVELS`). Oversized inputs would leave the rebuild loop
+    // with an intermediate subtree root as the "root", producing paths that
+    // can never verify on-chain.
+    check_leaf_capacity(leaves_hex.len())?;
+
     if (leaf_index as usize) >= leaves_hex.len() {
-        return Err(JsValue::from_str("leaf_index out of range"));
+        return Err("leaf_index out of range".to_string());
     }
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+        let bytes = hex::decode(l.trim()).map_err(|e| format!("bad leaf hex: {e}"))?;
+        if bytes.len() != 32 {
+            return Err(format!("leaf must be 32 bytes, got {}", bytes.len()));
+        }
+        level.push(Fr::from_le_bytes_mod_order(&bytes));
     }
 
     // Zero-subtree hashes, as the on-chain tree pads with.
@@ -689,3 +732,110 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         hex::encode(fr_to_le_bytes_32(root))
     ))
 }
+
+#[cfg(test)]
+mod v3_merkle_path_tests {
+    use super::*;
+    use privacy::poseidon_circom::v3_merkle_pair;
+
+    fn leaf(n: u64) -> String {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        hex::encode(b)
+    }
+
+    fn leaves_json(n: u64) -> String {
+        let v: Vec<String> = (0..n).map(leaf).collect();
+        serde_json::to_string(&v).unwrap()
+    }
+
+    fn parse(out: &str) -> (Vec<String>, String) {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        let path = v["path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect();
+        (path, v["root"].as_str().unwrap().to_string())
+    }
+
+    /// Recompute the root from `leaf_index` + path, exactly as the circuit does.
+    fn fold(leaf_hex: &str, path: &[String], leaf_index: u32) -> String {
+        let to_fr = |h: &str| {
+            Fr::from_le_bytes_mod_order(&hex::decode(h).expect("32-byte hex leaf/sibling"))
+        };
+        let mut cur = to_fr(leaf_hex);
+        for (depth, sib) in path.iter().enumerate() {
+            let s = to_fr(sib);
+            cur = if (leaf_index >> depth) & 1 == 0 {
+                v3_merkle_pair(cur, s)
+            } else {
+                v3_merkle_pair(s, cur)
+            };
+        }
+        hex::encode(fr_to_le_bytes_32(cur))
+    }
+
+    #[test]
+    fn rejects_empty_leaves() {
+        let err = v3_merkle_path_impl("[]", 0).unwrap_err();
+        assert_eq!(err, "leaves list cannot be empty");
+    }
+
+    #[test]
+    fn rejects_out_of_range_index() {
+        let err = v3_merkle_path_impl(&leaves_json(2), 2).unwrap_err();
+        assert_eq!(err, "leaf_index out of range");
+        assert!(v3_merkle_path_impl(&leaves_json(2), 1).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_json_and_bad_leaf_width() {
+        assert!(v3_merkle_path_impl("not json", 0)
+            .unwrap_err()
+            .starts_with("bad leaves json:"));
+        assert!(v3_merkle_path_impl("[\"deadbeef\"]", 0)
+            .unwrap_err()
+            .starts_with("leaf must be 32 bytes"));
+    }
+
+    #[test]
+    fn capacity_bound_matches_circuit_depth() {
+        assert_eq!(MAX_V3_LEAVES, 1u64 << TX_LEVELS);
+        assert!(check_leaf_capacity(0).is_ok());
+        assert!(check_leaf_capacity(1).is_ok());
+        // The guard is a pure bound check, so the limit can be exercised
+        // without materialising 2^32 leaves.
+        let at_cap = usize::try_from(MAX_V3_LEAVES).unwrap_or(usize::MAX);
+        if at_cap != usize::MAX {
+            assert!(check_leaf_capacity(at_cap).is_ok());
+            let err = check_leaf_capacity(at_cap + 1).unwrap_err();
+            assert!(err.starts_with("tree capacity exceeded:"));
+        }
+    }
+
+    #[test]
+    fn single_leaf_roundtrip() {
+        let out = v3_merkle_path_impl(&leaves_json(1), 0).unwrap();
+        let (path, root) = parse(&out);
+        assert_eq!(path.len(), TX_LEVELS);
+        assert_eq!(fold(&leaf(0), &path, 0), root);
+    }
+
+    #[test]
+    fn multi_leaf_paths_fold_to_reported_root() {
+        let leaves = 5u64;
+        let json = leaves_json(leaves);
+        let mut roots = Vec::new();
+        for i in 0..leaves {
+            let (path, root) = parse(&v3_merkle_path_impl(&json, i as u32).unwrap());
+            assert_eq!(path.len(), TX_LEVELS);
+            assert_eq!(fold(&leaf(i), &path, i as u32), root, "leaf {i}");
+            roots.push(root);
+        }
+        // Every leaf of one tree must fold to the same root.
+        assert!(roots.windows(2).all(|w| w[0] == w[1]));
+    }
+}
+

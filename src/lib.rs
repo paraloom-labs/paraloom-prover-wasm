@@ -45,6 +45,31 @@ fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
     Ok(o)
 }
 
+/// Strictly canonical field decoding, mirroring the on-chain program's
+/// `require_canonical_field` (`deposit_note` / `deposit_note_spl` / `transact`
+/// all reject non-canonical scalars with `BridgeError::NonCanonicalFieldElement`).
+///
+/// `Fr::from_le_bytes_mod_order` silently reduces any 256-bit value mod the
+/// BN254 scalar order r, aliasing `x` and `x + r` to the same field element:
+/// the prover would build commitments and proofs the on-chain program
+/// unconditionally rejects, stranding the note. On `[0, r)` the mod-order
+/// reduction is the identity, so decoding and re-encoding must reproduce the
+/// input bytes exactly — a mismatch means the value is >= r and got aliased.
+/// Canonical check on raw bytes: `Some(fr)` iff the 32-byte LE encoding is
+/// already canonical. Pure logic, no wasm interop, so it is unit-testable
+/// natively; the wasm entrypoints wrap it with a `JsValue` error below.
+fn canonical_fr(b: &[u8; 32]) -> Option<Fr> {
+    let fr = Fr::from_le_bytes_mod_order(b);
+    if &fr_to_le_bytes_32(fr) != b {
+        return None;
+    }
+    Some(fr)
+}
+
+fn canonical_fr32(b: &[u8; 32]) -> Result<Fr, JsValue> {
+    canonical_fr(b).ok_or_else(|| JsValue::from_str("non-canonical scalar: value >= BN254 modulus"))
+}
+
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
 /// wallet needs this to look up the note's Merkle path from the path server.
 #[wasm_bindgen]
@@ -396,6 +421,9 @@ use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubke
 #[wasm_bindgen]
 pub fn mint_to_asset(mint_hex: &str) -> Result<String, JsValue> {
     let mint = hex32(mint_hex)?;
+    // Each half is only 16 bytes (< 2^128 < r), so both are always canonical:
+    // `from_le_bytes_mod_order` is the identity on 128-bit inputs and no
+    // aliasing is possible. Full 32-byte scalars go through `canonical_fr32`.
     let lo = Fr::from_le_bytes_mod_order(&mint[..16]);
     let hi = Fr::from_le_bytes_mod_order(&mint[16..]);
     Ok(hex::encode(fr_to_le_bytes_32(v3_merkle_pair(lo, hi))))
@@ -404,7 +432,7 @@ pub fn mint_to_asset(mint_hex: &str) -> Result<String, JsValue> {
 /// Derive the v3 spend public key `Poseidon1(privkey)` (circom Poseidon).
 #[wasm_bindgen]
 pub fn v3_note_pubkey(privkey_hex: &str) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let sk = canonical_fr32(&hex32(privkey_hex)?)?;
     Ok(hex::encode(fr_to_le_bytes_32(v3_pubkey(sk))))
 }
 
@@ -418,8 +446,8 @@ pub fn v3_note_commitment(
 ) -> Result<String, JsValue> {
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        canonical_fr32(&hex32(pubkey_hex)?)?,
+        canonical_fr32(&hex32(blinding_hex)?)?,
         Fr::from(0u64), // NATIVE_SOL
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -438,9 +466,9 @@ pub fn v3_note_commitment_asset(
 ) -> Result<String, JsValue> {
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        canonical_fr32(&hex32(pubkey_hex)?)?,
+        canonical_fr32(&hex32(blinding_hex)?)?,
+        canonical_fr32(&hex32(asset_id_hex)?)?,
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -497,7 +525,10 @@ pub fn prove_transact(
             "positive ext_amount: deposits go through deposit_note, not transact",
         ));
     }
-    let root = hex32(root_hex)?;
+    // The on-chain `transact` entrypoint rejects a non-canonical root and
+    // output commitments, so mirror that before any proof work is spent.
+    let root_fr = canonical_fr32(&hex32(root_hex)?)?;
+    let root = fr_to_le_bytes_32(root_fr);
     let recipient = hex32(recipient_hex)?;
 
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
@@ -510,7 +541,7 @@ pub fn prove_transact(
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let asset = canonical_fr32(&hex32(asset_id_hex)?)?;
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
@@ -532,11 +563,11 @@ pub fn prove_transact(
             path.push(hex32(sib)?);
         }
 
-        let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let sk = canonical_fr32(&privkey)?;
         let c = v3_commit(
             Fr::from(inp.amount),
             v3_pubkey(sk),
-            Fr::from_le_bytes_mod_order(&blinding),
+            canonical_fr32(&blinding)?,
             asset,
         );
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
@@ -559,8 +590,8 @@ pub fn prove_transact(
         let blinding = hex32(&outp.blinding_hex)?;
         let oc = v3_commit(
             Fr::from(outp.amount),
-            Fr::from_le_bytes_mod_order(&pubkey),
-            Fr::from_le_bytes_mod_order(&blinding),
+            canonical_fr32(&pubkey)?,
+            canonical_fr32(&blinding)?,
             asset,
         );
         output_commitments.push(fr_to_le_bytes_32(oc));
@@ -688,4 +719,61 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use ark_ff::{BigInteger, PrimeField};
+    use hex;
+
+    /// The 32-byte LE encoding of the BN254 scalar-field modulus r.
+    fn modulus_le() -> [u8; 32] {
+        let mut v = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        v.resize(32, 0);
+        let mut o = [0u8; 32];
+        o.copy_from_slice(&v[..32]);
+        o
+    }
+
+    /// LE-increment of a 32-byte value (used for r + 1, which still fits in
+    /// 2^256 because r < 2^254).
+    fn le_inc(b: &[u8; 32]) -> [u8; 32] {
+        let mut o = *b;
+        for byte in o.iter_mut() {
+            let (n, carry) = byte.overflowing_add(1);
+            *byte = n;
+            if !carry {
+                break;
+            }
+        }
+        o
+    }
+
+    #[test]
+    fn canonical_fr32_accepts_canonical_values() {
+        // zero
+        assert_eq!(canonical_fr(&[0u8; 32]), Some(Fr::from(0u64)));
+        // five, round-tripped through the canonical LE encoding
+        assert_eq!(
+            canonical_fr(&fr_to_le_bytes_32(Fr::from(5u64))),
+            Some(Fr::from(5u64))
+        );
+    }
+
+    #[test]
+    fn canonical_fr32_rejects_the_modulus_and_beyond() {
+        // r itself encodes as a 32-byte blob; from_le_bytes_mod_order would
+        // silently alias it to 0 — the decoder must refuse it instead.
+        assert_eq!(canonical_fr(&modulus_le()), None);
+        // r + 1 aliases to 1 under mod_order; must be refused too.
+        assert_eq!(canonical_fr(&le_inc(&modulus_le())), None);
+    }
+
+    // NOTE: the `#[wasm_bindgen]` entrypoints cannot be exercised natively —
+    // wasm-bindgen stubs (including `JsValue::from_str` in their error paths)
+    // abort on non-wasm32 targets. Their gates call the exact `canonical_fr`
+    // covered above, mirroring the on-chain `transact` checks at
+    // programs/paraloom/src/lib.rs (root + output commitments + deposit-note
+    // scalars) and `deposit_note`/`deposit_note_spl` (pubkey + blinding).
 }

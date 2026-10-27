@@ -517,6 +517,7 @@ pub fn prove_transact(
     let mut in_blindings = Vec::new();
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
+    let mut input_commitments = Vec::new();
     let mut nullifiers = Vec::new();
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
@@ -541,6 +542,7 @@ pub fn prove_transact(
         );
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
+        input_commitments.push(fr_to_le_bytes_32(c));
         nullifiers.push(fr_to_le_bytes_32(nf));
 
         in_amounts.push(Some(inp.amount));
@@ -567,6 +569,9 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+    }
+    if let Err(msg) = validate_transact_commitments(&input_commitments, &output_commitments) {
+        return Err(JsValue::from_str(msg));
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =
@@ -688,4 +693,52 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+fn validate_transact_commitments(
+    input_commitments: &[[u8; 32]],
+    output_commitments: &[[u8; 32]],
+) -> Result<(), &'static str> {
+    if output_commitments.len() == 2 && output_commitments[0] == output_commitments[1] {
+        return Err("duplicate output commitments in transact");
+    }
+    if output_commitments
+        .iter()
+        .any(|oc| input_commitments.contains(oc))
+    {
+        return Err("output commitment collides with input commitment");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod transact_validation_tests {
+    use super::validate_transact_commitments;
+
+    #[test]
+    fn rejects_duplicate_output_commitments() {
+        let in_c = [[1u8; 32], [2u8; 32]];
+        let out_c = [[9u8; 32], [9u8; 32]];
+        assert_eq!(
+            validate_transact_commitments(&in_c, &out_c),
+            Err("duplicate output commitments in transact")
+        );
+    }
+
+    #[test]
+    fn rejects_input_output_commitment_collision() {
+        let in_c = [[1u8; 32], [2u8; 32]];
+        let out_c = [[1u8; 32], [9u8; 32]];
+        assert_eq!(
+            validate_transact_commitments(&in_c, &out_c),
+            Err("output commitment collides with input commitment")
+        );
+    }
+
+    #[test]
+    fn accepts_distinct_commitments() {
+        let in_c = [[1u8; 32], [2u8; 32]];
+        let out_c = [[3u8; 32], [4u8; 32]];
+        assert!(validate_transact_commitments(&in_c, &out_c).is_ok());
+    }
 }

@@ -35,10 +35,110 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
+#[cfg(target_arch = "wasm32")]
+fn js_err(msg: &str) -> JsValue {
+    JsValue::from_str(msg)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn js_err(_msg: &str) -> JsValue {
+    JsValue::NULL
+}
+
+/// On-chain protocol withdrawal fee in basis points (`programs/paraloom/src/lib.rs`).
+pub const WITHDRAWAL_FEE_BPS: u64 = 25;
+
+/// Maximum gross withdrawal amount that does not overflow `gross.checked_mul(WITHDRAWAL_FEE_BPS)`
+/// in the on-chain `transact` and `transact_spl` handlers (`u64::MAX / 25 = 737_869_762_948_382_064`).
+pub const MAX_ONCHAIN_WITHDRAWAL_GROSS: u64 = u64::MAX / WITHDRAWAL_FEE_BPS;
+
+/// Validate v2 withdrawal amount and destination recipient before circuit synthesis.
+pub fn validate_withdrawal_v2_settlement(
+    amount: u64,
+    dest_recipient: &[u8; 32],
+) -> Result<(), &'static str> {
+    if amount == 0 {
+        return Err("withdrawal amount must be non-zero");
+    }
+    if amount > MAX_ONCHAIN_WITHDRAWAL_GROSS {
+        return Err(
+            "withdrawal amount overflows on-chain fee calculation (exceeds u64::MAX / WITHDRAWAL_FEE_BPS)",
+        );
+    }
+    if *dest_recipient == [0u8; 32] {
+        return Err("withdrawal dest_recipient cannot be the all-zero address");
+    }
+    Ok(())
+}
+
+/// Validate v2 transfer input note amounts and leaf positions before circuit synthesis.
+pub fn validate_transfer_v2_inputs(
+    in_amounts: &[u64; 2],
+    in_leaf_indices: &[u64; 2],
+) -> Result<(), &'static str> {
+    if in_amounts[0] == 0 && in_amounts[1] == 0 {
+        return Err("transfer must spend at least one non-zero input note");
+    }
+    if in_amounts[0] > 0 && in_amounts[1] > 0 && in_leaf_indices[0] == in_leaf_indices[1] {
+        return Err("non-zero transfer input notes cannot share the same leaf_index");
+    }
+    Ok(())
+}
+
+/// Validate v3 unified transact settlement invariants and active input notes before circuit synthesis.
+///
+/// Enforces:
+/// 1. `ext_amount <= 0` (deposits go through `deposit_note`).
+/// 2. For withdrawals (`ext_amount < 0`):
+///    - `ext_amount.unsigned_abs() <= MAX_ONCHAIN_WITHDRAWAL_GROSS` (`u64::MAX / 25`), preventing
+///      proofs that inevitably revert on-chain at `gross.checked_mul(WITHDRAWAL_FEE_BPS)`.
+///    - `recipient != [0u8; 32]`, preventing withdrawals bound to the unspendable zero/SystemProgram
+///      address when a caller forgets to override the default transfer zero recipient.
+/// 3. For pure shielded transfers (`ext_amount == 0`):
+///    - `recipient == [0u8; 32]`, matching `TransactVerificationRequest` and relayer settlement.
+/// 4. At least one input note has `amount > 0`:
+///    - `TransactCircuitV3` gates Merkle membership on `(folded_root - root) * amount == 0`.
+///      If both inputs have `amount == 0` (with `ext_amount == 0` and `outputs == [0, 0]`),
+///      the circuit skips Merkle membership on BOTH inputs simultaneously and synthesizes a
+///      verifier-valid Groth16 proof against any root without owning a single note in the tree.
+/// 5. Two non-zero input notes cannot claim the same tree position (`leaf_index`).
+pub fn validate_transact_settlement_and_inputs(
+    ext_amount: i64,
+    recipient: &[u8; 32],
+    in_amounts: &[u64; 2],
+    in_leaf_indices: &[u64; 2],
+) -> Result<(), &'static str> {
+    if ext_amount > 0 {
+        return Err("positive ext_amount: deposits go through deposit_note, not transact");
+    }
+    if ext_amount < 0 {
+        let gross = ext_amount.unsigned_abs();
+        if gross > MAX_ONCHAIN_WITHDRAWAL_GROSS {
+            return Err(
+                "withdrawal ext_amount overflows on-chain fee calculation (exceeds u64::MAX / WITHDRAWAL_FEE_BPS)",
+            );
+        }
+        if *recipient == [0u8; 32] {
+            return Err("withdrawal recipient cannot be the all-zero address");
+        }
+    } else if *recipient != [0u8; 32] {
+        return Err("pure shielded transfer (ext_amount == 0) requires all-zero recipient");
+    }
+    if in_amounts[0] == 0 && in_amounts[1] == 0 {
+        return Err(
+            "transact must spend at least one non-zero input note (all-zero inputs bypass in-circuit Merkle membership)",
+        );
+    }
+    if in_amounts[0] > 0 && in_amounts[1] > 0 && in_leaf_indices[0] == in_leaf_indices[1] {
+        return Err("non-zero transact input notes cannot share the same leaf_index");
+    }
+    Ok(())
+}
+
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+    let b = hex::decode(s.trim()).map_err(|e| js_err(&format!("bad hex: {e}")))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err(js_err("expected 32-byte hex"));
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
@@ -178,6 +278,7 @@ pub fn prove_withdrawal_v2(
     let privkey = hex32(privkey_hex)?;
     let asset_id = hex32(asset_id_hex)?;
     let dest_recipient = hex32(dest_recipient_hex)?;
+    validate_withdrawal_v2_settlement(amount, &dest_recipient).map_err(js_err)?;
 
     let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
         .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
@@ -295,10 +396,16 @@ pub fn prove_transfer_v2(
     let outputs: Vec<TransferOutputV2> = serde_json::from_str(outputs_json)
         .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str(
+        return Err(js_err(
             "transfer requires exactly 2 inputs and 2 outputs",
         ));
     }
+    let v2_in_amounts = [inputs[0].amount, inputs[1].amount];
+    let v2_in_indices = [
+        leaf_index_from(&inputs[0].indices),
+        leaf_index_from(&inputs[1].indices),
+    ];
+    validate_transfer_v2_inputs(&v2_in_amounts, &v2_in_indices).map_err(js_err)?;
 
     let mut nullifiers = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
@@ -493,7 +600,7 @@ pub fn prove_transact(
     outputs_json: &str,
 ) -> Result<String, JsValue> {
     if ext_amount > 0 {
-        return Err(JsValue::from_str(
+        return Err(js_err(
             "positive ext_amount: deposits go through deposit_note, not transact",
         ));
     }
@@ -501,12 +608,19 @@ pub fn prove_transact(
     let recipient = hex32(recipient_hex)?;
 
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad outputs json: {e}")))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
+        return Err(js_err("transact is fixed 2-in/2-out"));
     }
+    validate_transact_settlement_and_inputs(
+        ext_amount,
+        &recipient,
+        &[inputs[0].amount, inputs[1].amount],
+        &[inputs[0].leaf_index, inputs[1].leaf_index],
+    )
+    .map_err(js_err)?;
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
@@ -688,4 +802,161 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod zero_input_and_settlement_guard_tests {
+    use super::*;
+    use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
+
+    /// Demonstrates the underlying circuit behavior: when both inputs have `amount == 0`,
+    /// `TransactCircuitV3` skips Merkle membership (`(folded_root - root) * 0 == 0`) on BOTH
+    /// inputs simultaneously and satisfies all R1CS constraints against an arbitrary fake root
+    /// (`[0xAA; 32]`) that contains neither input commitment.
+    /// `validate_transact_settlement_and_inputs` blocks this zero-input membership bypass at
+    /// the prover boundary.
+    #[test]
+    fn zero_value_inputs_bypass_in_circuit_merkle_membership_unless_rejected_by_prover() {
+        let asset = Fr::from(0u64);
+        let sk0 = Fr::from(11u64);
+        let sk1 = Fr::from(12u64);
+        let bl0 = Fr::from(1u64);
+        let bl1 = Fr::from(2u64);
+
+        let c0 = v3_commit(Fr::from(0u64), v3_pubkey(sk0), bl0, asset);
+        let c1 = v3_commit(Fr::from(0u64), v3_pubkey(sk1), bl1, asset);
+        let nf0 = v3_nullifier(c0, Fr::from(0u64), v3_signature(sk0, c0, Fr::from(0u64)));
+        let nf1 = v3_nullifier(c1, Fr::from(0u64), v3_signature(sk1, c1, Fr::from(0u64)));
+
+        let out_pk0 = v3_pubkey(Fr::from(21u64));
+        let out_pk1 = v3_pubkey(Fr::from(22u64));
+        let out_c0 = v3_commit(Fr::from(0u64), out_pk0, Fr::from(3u64), asset);
+        let out_c1 = v3_commit(Fr::from(0u64), out_pk1, Fr::from(4u64), asset);
+
+        let forged_root = [0xAAu8; 32];
+        let circuit = TransactCircuitV3 {
+            root: Some(forged_root),
+            public_amount: Some(fr_to_le_bytes_32(Fr::from(0u64))),
+            ext_data_hash: Some([0x11u8; 32]),
+            asset_id: Some(fr_to_le_bytes_32(asset)),
+            input_nullifiers: vec![Some(fr_to_le_bytes_32(nf0)), Some(fr_to_le_bytes_32(nf1))],
+            output_commitments: vec![
+                Some(fr_to_le_bytes_32(out_c0)),
+                Some(fr_to_le_bytes_32(out_c1)),
+            ],
+            in_amounts: vec![Some(0), Some(0)],
+            in_privkeys: vec![Some(fr_to_le_bytes_32(sk0)), Some(fr_to_le_bytes_32(sk1))],
+            in_blindings: vec![Some(fr_to_le_bytes_32(bl0)), Some(fr_to_le_bytes_32(bl1))],
+            in_leaf_indices: vec![Some(0), Some(0)],
+            in_paths: vec![Some(vec![[0u8; 32]; TX_LEVELS]), Some(vec![[0u8; 32]; TX_LEVELS])],
+            out_amounts: vec![Some(0), Some(0)],
+            out_pubkeys: vec![
+                Some(fr_to_le_bytes_32(out_pk0)),
+                Some(fr_to_le_bytes_32(out_pk1)),
+            ],
+            out_blindings: vec![
+                Some(fr_to_le_bytes_32(Fr::from(3u64))),
+                Some(fr_to_le_bytes_32(Fr::from(4u64))),
+            ],
+        };
+
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("circuit synthesis succeeds");
+        assert!(
+            cs.is_satisfied().unwrap(),
+            "without prover-side guard, [0, 0] inputs satisfy TransactCircuitV3 against forged_root"
+        );
+
+        // Prover guard rejects [0, 0] inputs before circuit synthesis:
+        let err = validate_transact_settlement_and_inputs(0, &[0u8; 32], &[0, 0], &[0, 1])
+            .expect_err("all-zero input notes must be rejected");
+        assert!(err.contains("at least one non-zero input note"));
+    }
+
+    #[test]
+    fn transact_guard_rejects_withdrawal_fee_overflow_and_i64_min() {
+        let recipient = [0x33u8; 32];
+        // Exact boundary: MAX_ONCHAIN_WITHDRAWAL_GROSS (u64::MAX / 25) is accepted.
+        let max_valid_i64 = -(MAX_ONCHAIN_WITHDRAWAL_GROSS as i64);
+        assert!(
+            validate_transact_settlement_and_inputs(
+                max_valid_i64,
+                &recipient,
+                &[MAX_ONCHAIN_WITHDRAWAL_GROSS, 0],
+                &[0, 0]
+            )
+            .is_ok()
+        );
+
+        // 1 unit above MAX_ONCHAIN_WITHDRAWAL_GROSS overflows on-chain `gross.checked_mul(25)`.
+        let overflow_i64 = -((MAX_ONCHAIN_WITHDRAWAL_GROSS as i64) + 1);
+        let err = validate_transact_settlement_and_inputs(
+            overflow_i64,
+            &recipient,
+            &[MAX_ONCHAIN_WITHDRAWAL_GROSS + 1, 0],
+            &[0, 0],
+        )
+        .expect_err("withdrawal exceeding u64::MAX / 25 must be rejected");
+        assert!(err.contains("overflows on-chain fee calculation"));
+
+        // i64::MIN (-9_223_372_036_854_775_808) also exceeds MAX_ONCHAIN_WITHDRAWAL_GROSS.
+        assert!(
+            validate_transact_settlement_and_inputs(
+                i64::MIN,
+                &recipient,
+                &[u64::MAX, 0],
+                &[0, 0]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn transact_guard_enforces_recipient_binding_for_withdrawals_and_transfers() {
+        // Withdrawal (`ext_amount < 0`) with all-zero recipient (`SystemProgram::id()`) must fail.
+        let err = validate_transact_settlement_and_inputs(-500, &[0u8; 32], &[1000, 0], &[0, 0])
+            .expect_err("withdrawal to all-zero recipient must be rejected");
+        assert!(err.contains("all-zero address"));
+
+        // Pure shielded transfer (`ext_amount == 0`) with non-zero recipient must fail.
+        let err = validate_transact_settlement_and_inputs(0, &[0x11u8; 32], &[1000, 0], &[0, 0])
+            .expect_err("pure shielded transfer with non-zero recipient must be rejected");
+        assert!(err.contains("requires all-zero recipient"));
+
+        // Pure shielded transfer (`ext_amount == 0`) with all-zero recipient succeeds.
+        assert!(
+            validate_transact_settlement_and_inputs(0, &[0u8; 32], &[1000, 0], &[0, 0]).is_ok()
+        );
+    }
+
+    #[test]
+    fn transact_and_transfer_v2_reject_duplicate_leaf_index_on_two_nonzero_inputs() {
+        // Two non-zero inputs claiming the same leaf_index (e.g., 7) must be rejected.
+        let err = validate_transact_settlement_and_inputs(0, &[0u8; 32], &[600, 400], &[7, 7])
+            .expect_err("two non-zero inputs at the same leaf_index must be rejected");
+        assert!(err.contains("same leaf_index"));
+
+        // One non-zero input at index 0 + one zero-value dummy input at index 0 is allowed.
+        assert!(
+            validate_transact_settlement_and_inputs(0, &[0u8; 32], &[1000, 0], &[0, 0]).is_ok()
+        );
+
+        // V2 transfer guards:
+        assert!(validate_transfer_v2_inputs(&[0, 0], &[0, 1]).is_err());
+        assert!(validate_transfer_v2_inputs(&[500, 500], &[3, 3]).is_err());
+        assert!(validate_transfer_v2_inputs(&[500, 500], &[3, 4]).is_ok());
+
+        // V2 withdrawal guards:
+        assert!(validate_withdrawal_v2_settlement(0, &[0x22u8; 32]).is_err());
+        assert!(validate_withdrawal_v2_settlement(1000, &[0u8; 32]).is_err());
+        assert!(
+            validate_withdrawal_v2_settlement(MAX_ONCHAIN_WITHDRAWAL_GROSS + 1, &[0x22u8; 32])
+                .is_err()
+        );
+        assert!(
+            validate_withdrawal_v2_settlement(MAX_ONCHAIN_WITHDRAWAL_GROSS, &[0x22u8; 32]).is_ok()
+        );
+    }
 }

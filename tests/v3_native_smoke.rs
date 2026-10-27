@@ -111,6 +111,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     )
@@ -246,6 +247,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );
@@ -253,5 +255,105 @@ fn v3_merkle_path_output_proves_membership() {
         res.is_ok(),
         "a v3_merkle_path path must prove membership: {:?}",
         res.err()
+    );
+}
+
+#[test]
+fn prove_transact_rejects_all_zero_inputs_fee_overflow_bad_recipient_and_duplicate_leaf_index() {
+    use paraloom_prover_wasm::MAX_ONCHAIN_WITHDRAWAL_GROSS;
+
+    let z = hx(&[0u8; 32]);
+    let recipient = hx(&[3u8; 32]);
+    let path_json = serde_json::to_string(&vec![z.clone(); 32]).unwrap();
+    let opk0 = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(61u64)))).unwrap();
+    let opk1 = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(62u64)))).unwrap();
+
+    // 1. All-zero inputs (`[0, 0]`) must be rejected before circuit synthesis
+    //    because `TransactCircuitV3` skips Merkle membership when `amount == 0`.
+    let zero_inputs = format!(
+        r#"[
+          {{"amount":0,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}},
+          {{"amount":0,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":1,"path_hex":{path_json}}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(11u64))),
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(12u64))),
+        hx(&fr_to_le(&Fr::from(2u64))),
+    );
+    let zero_outputs = format!(
+        r#"[
+          {{"amount":0,"pubkey_hex":"{opk0}","blinding_hex":"{}"}},
+          {{"amount":0,"pubkey_hex":"{opk1}","blinding_hex":"{}"}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(3u64))),
+        hx(&fr_to_le(&Fr::from(4u64))),
+    );
+    assert!(
+        prove_transact(&[], &z, 0, &z, &z, &zero_inputs, &zero_outputs).is_err(),
+        "all-zero input notes must be rejected by prove_transact"
+    );
+
+    // 2. Withdrawal exceeding MAX_ONCHAIN_WITHDRAWAL_GROSS (`u64::MAX / 25`) must be rejected.
+    let active_inputs = format!(
+        r#"[
+          {{"amount":{},"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}},
+          {{"amount":0,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}}
+        ]"#,
+        MAX_ONCHAIN_WITHDRAWAL_GROSS + 1,
+        hx(&fr_to_le(&Fr::from(11u64))),
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(12u64))),
+        hx(&fr_to_le(&Fr::from(2u64))),
+    );
+    let overflow_ext = -((MAX_ONCHAIN_WITHDRAWAL_GROSS as i64) + 1);
+    assert!(
+        prove_transact(
+            &[],
+            &z,
+            overflow_ext,
+            &recipient,
+            &z,
+            &active_inputs,
+            &zero_outputs
+        )
+        .is_err(),
+        "withdrawal exceeding u64::MAX / 25 must be rejected by prove_transact"
+    );
+
+    // 3. Withdrawal (`ext_amount < 0`) with all-zero recipient (`[0u8; 32]`) and
+    //    pure shielded transfer (`ext_amount == 0`) with non-zero recipient must be rejected.
+    let one_real_input = format!(
+        r#"[
+          {{"amount":1000,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}},
+          {{"amount":0,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(11u64))),
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(12u64))),
+        hx(&fr_to_le(&Fr::from(2u64))),
+    );
+    assert!(
+        prove_transact(&[], &z, -500, &z, &z, &one_real_input, &zero_outputs).is_err(),
+        "withdrawal to all-zero recipient must be rejected"
+    );
+    assert!(
+        prove_transact(&[], &z, 0, &recipient, &z, &one_real_input, &zero_outputs).is_err(),
+        "pure shielded transfer with non-zero recipient must be rejected"
+    );
+
+    // 4. Two non-zero inputs claiming the same leaf_index must be rejected.
+    let dup_leaf_inputs = format!(
+        r#"[
+          {{"amount":600,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":5,"path_hex":{path_json}}},
+          {{"amount":400,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":5,"path_hex":{path_json}}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(11u64))),
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(12u64))),
+        hx(&fr_to_le(&Fr::from(2u64))),
+    );
+    assert!(
+        prove_transact(&[], &z, 0, &z, &z, &dup_leaf_inputs, &zero_outputs).is_err(),
+        "two non-zero inputs sharing the same leaf_index must be rejected"
     );
 }

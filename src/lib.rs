@@ -518,6 +518,7 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
+    let mut input_commitments = Vec::new();
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
         let blinding = hex32(&inp.blinding_hex)?;
@@ -543,6 +544,8 @@ pub fn prove_transact(
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
         nullifiers.push(fr_to_le_bytes_32(nf));
 
+        input_commitments.push(fr_to_le_bytes_32(c));
+
         in_amounts.push(Some(inp.amount));
         in_privkeys.push(Some(privkey));
         in_blindings.push(Some(blinding));
@@ -567,6 +570,27 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+    }
+
+    // Reject duplicate output commitments: two outputs with identical
+    // (amount, pubkey, blinding) produce the same commitment, permanently
+    // stranding the second note's shielded balance.
+    if output_commitments[0] == output_commitments[1] {
+        return Err(JsValue::from_str(
+            "duplicate output commitments: output_commitments[0] == output_commitments[1]",
+        ));
+    }
+
+    // Reject any input/output commitment collision: an output commitment must
+    // not equal any input commitment, otherwise the note would be double-spent.
+    for ic in &input_commitments {
+        for oc in &output_commitments {
+            if ic == oc {
+                return Err(JsValue::from_str(
+                    "input/output commitment collision: an output commitment equals an input commitment",
+                ));
+            }
+        }
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =

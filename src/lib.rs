@@ -301,6 +301,7 @@ pub fn prove_transfer_v2(
     }
 
     let mut nullifiers = Vec::with_capacity(2);
+    let mut input_commitments = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
@@ -319,10 +320,15 @@ pub fn prove_transfer_v2(
         let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
         let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
         nullifiers.push(fr_to_le_bytes_32(nullifier_fr));
+        input_commitments.push(fr_to_le_bytes_32(commitment_fr));
         input_values.push(inp.amount);
         input_blindings.push(blinding);
         input_privkeys.push(privkey);
         input_paths.push(merkle_path_from(&inp.path_hex, &inp.indices)?);
+    }
+
+    if nullifiers[0] == nullifiers[1] {
+        return Err(JsValue::from_str("duplicate input nullifiers"));
     }
 
     let mut output_commitments = Vec::with_capacity(2);
@@ -342,6 +348,18 @@ pub fn prove_transfer_v2(
         output_values.push(out.amount);
         output_blindings.push(blinding);
         output_pubkeys.push(pubkey);
+    }
+
+    if output_commitments[0] == output_commitments[1] {
+        return Err(JsValue::from_str("duplicate output commitments"));
+    }
+
+    for out_c in &output_commitments {
+        if input_commitments.contains(out_c) {
+            return Err(JsValue::from_str(
+                "output commitment collides with input commitment",
+            ));
+        }
     }
 
     let circuit = TransferCircuitV2::with_witness(
@@ -518,6 +536,7 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
+    let mut input_commitments = Vec::new();
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
         let blinding = hex32(&inp.blinding_hex)?;
@@ -542,12 +561,17 @@ pub fn prove_transact(
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
         nullifiers.push(fr_to_le_bytes_32(nf));
+        input_commitments.push(fr_to_le_bytes_32(c));
 
         in_amounts.push(Some(inp.amount));
         in_privkeys.push(Some(privkey));
         in_blindings.push(Some(blinding));
         in_leaf_indices.push(Some(inp.leaf_index));
         in_paths.push(Some(path));
+    }
+
+    if nullifiers[0] == nullifiers[1] {
+        return Err(JsValue::from_str("duplicate input nullifiers"));
     }
 
     let mut out_amounts = Vec::new();
@@ -567,6 +591,18 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+    }
+
+    if output_commitments[0] == output_commitments[1] {
+        return Err(JsValue::from_str("duplicate output commitments"));
+    }
+
+    for out_c in &output_commitments {
+        if input_commitments.contains(out_c) {
+            return Err(JsValue::from_str(
+                "output commitment collides with input commitment",
+            ));
+        }
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =

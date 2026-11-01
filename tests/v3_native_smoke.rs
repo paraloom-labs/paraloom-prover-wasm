@@ -106,11 +106,13 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
     );
 
     let recipient = [3u8; 32];
+    let native_asset = [0u8; 32];
     let out = prove_transact(
         &pk_bytes,
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&native_asset),
         &inputs,
         &outputs,
     )
@@ -246,6 +248,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );
@@ -254,4 +257,86 @@ fn v3_merkle_path_output_proves_membership() {
         "a v3_merkle_path path must prove membership: {:?}",
         res.err()
     );
+}
+
+#[test]
+fn prove_transact_rejects_duplicate_output_commitments_and_commitment_collisions() {
+    let dummy_path = serde_json::to_string(&vec!["00".repeat(32); 32]).unwrap();
+    let sk0 = hx(&fr_to_le(&Fr::from(51u64)));
+    let bl0 = hx(&fr_to_le(&Fr::from(5u64)));
+    let sk1 = hx(&fr_to_le(&Fr::from(52u64)));
+    let bl1 = hx(&fr_to_le(&Fr::from(6u64)));
+
+    let inputs = format!(
+        r#"[
+          {{"amount":500,"privkey_hex":"{sk0}","blinding_hex":"{bl0}","leaf_index":0,"path_hex":{dummy_path}}},
+          {{"amount":0,"privkey_hex":"{sk1}","blinding_hex":"{bl1}","leaf_index":1,"path_hex":{dummy_path}}}
+        ]"#
+    );
+
+    let opk = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(61u64)))).unwrap();
+    let bl_out = hx(&fr_to_le(&Fr::from(10u64)));
+
+    // 1. Duplicate output commitments (identical notes) must be rejected
+    let dup_outputs = format!(
+        r#"[
+          {{"amount":250,"pubkey_hex":"{opk}","blinding_hex":"{bl_out}"}},
+          {{"amount":250,"pubkey_hex":"{opk}","blinding_hex":"{bl_out}"}}
+        ]"#
+    );
+    let res_dup = prove_transact(
+        &[],
+        &hx(&[0u8; 32]),
+        -500,
+        &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
+        &inputs,
+        &dup_outputs,
+    );
+    assert!(res_dup.is_err(), "must reject duplicate output commitments");
+
+    // 2. Output commitment colliding with input note must be rejected
+    let input0_pubkey = v3_note_pubkey(&sk0).unwrap();
+    let collision_outputs = format!(
+        r#"[
+          {{"amount":500,"pubkey_hex":"{input0_pubkey}","blinding_hex":"{bl0}"}},
+          {{"amount":0,"pubkey_hex":"{opk}","blinding_hex":"{bl_out}"}}
+        ]"#
+    );
+    let res_coll = prove_transact(
+        &[],
+        &hx(&[0u8; 32]),
+        -500,
+        &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
+        &inputs,
+        &collision_outputs,
+    );
+    assert!(res_coll.is_err(), "must reject output commitment colliding with input note");
+
+    // 3. Duplicate input nullifiers must be rejected
+    let dup_inputs = format!(
+        r#"[
+          {{"amount":500,"privkey_hex":"{sk0}","blinding_hex":"{bl0}","leaf_index":0,"path_hex":{dummy_path}}},
+          {{"amount":500,"privkey_hex":"{sk0}","blinding_hex":"{bl0}","leaf_index":0,"path_hex":{dummy_path}}}
+        ]"#
+    );
+    let distinct_outputs = format!(
+        r#"[
+          {{"amount":400,"pubkey_hex":"{opk}","blinding_hex":"{}"}},
+          {{"amount":100,"pubkey_hex":"{opk}","blinding_hex":"{}"}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(2u64))),
+    );
+    let res_null = prove_transact(
+        &[],
+        &hx(&[0u8; 32]),
+        -500,
+        &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
+        &dup_inputs,
+        &distinct_outputs,
+    );
+    assert!(res_null.is_err(), "must reject duplicate input nullifiers");
 }

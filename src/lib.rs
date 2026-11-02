@@ -396,6 +396,13 @@ use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubke
 #[wasm_bindgen]
 pub fn mint_to_asset(mint_hex: &str) -> Result<String, JsValue> {
     let mint = hex32(mint_hex)?;
+    // Reject the all-zero native SOL placeholder: it is not an SPL mint and
+    // hashing it would strand any note committed with the derived asset id.
+    if mint == [0u8; 32] {
+        return Err(JsValue::from_str(
+            "mint_to_asset: native SOL placeholder ([0u8;32]) is not an SPL mint",
+        ));
+    }
     let lo = Fr::from_le_bytes_mod_order(&mint[..16]);
     let hi = Fr::from_le_bytes_mod_order(&mint[16..]);
     Ok(hex::encode(fr_to_le_bytes_32(v3_merkle_pair(lo, hi))))
@@ -645,15 +652,37 @@ pub fn prove_transact(
 #[wasm_bindgen]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
     use privacy::poseidon_circom::v3_merkle_pair;
+    use std::collections::HashSet;
 
     let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
         .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
     if (leaf_index as usize) >= leaves_hex.len() {
         return Err(JsValue::from_str("leaf_index out of range"));
     }
+    let mut seen_leaves = HashSet::new();
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+        let raw = hex32(l)?;
+        // Reject all-zero leaf commitments (collide with the empty-leaf sentinel).
+        if raw == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "v3_merkle_path: all-zero leaf commitment is not allowed",
+            ));
+        }
+        let fr = Fr::from_le_bytes_mod_order(&raw);
+        // Reject non-canonical leaf commitments (values >= Fr::MODULUS).
+        if fr_to_le_bytes_32(fr) != raw {
+            return Err(JsValue::from_str(
+                "v3_merkle_path: non-canonical leaf commitment",
+            ));
+        }
+        // Reject duplicate leaf commitments.
+        if !seen_leaves.insert(raw) {
+            return Err(JsValue::from_str(
+                "v3_merkle_path: duplicate leaf commitment",
+            ));
+        }
+        level.push(fr);
     }
 
     // Zero-subtree hashes, as the on-chain tree pads with.

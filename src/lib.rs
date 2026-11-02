@@ -75,7 +75,11 @@ pub fn note_commitment(
 /// [`v3_note_pubkey`], which uses circom Poseidon and is not interchangeable.
 #[wasm_bindgen]
 pub fn spend_pubkey(privkey_hex: &str) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let privkey = hex32(privkey_hex)?;
+    if privkey == [0u8; 32] {
+        return Err(JsValue::from_str("spend_pubkey: zero spend key is not allowed"));
+    }
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
     Ok(hex::encode(fr_to_le_bytes_32(poseidon_pubkey(sk))))
 }
 
@@ -308,6 +312,11 @@ pub fn prove_transfer_v2(
     for inp in &inputs {
         let blinding = hex32(&inp.blinding_hex)?;
         let privkey = hex32(&inp.privkey_hex)?;
+        if inp.amount > 0 && privkey == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transfer_v2: zero spend key is not allowed for positive-value notes",
+            ));
+        }
         let sk = Fr::from_le_bytes_mod_order(&privkey);
         let commitment_fr = poseidon_commit_spend(
             Fr::from(inp.amount),
@@ -332,6 +341,16 @@ pub fn prove_transfer_v2(
     for out in &outputs {
         let blinding = hex32(&out.blinding_hex)?;
         let pubkey = hex32(&out.pubkey_hex)?;
+        if out.amount > 0 && pubkey == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transfer_v2: zero output pubkey is not allowed for positive-value notes",
+            ));
+        }
+        if out.amount > 0 && blinding == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transfer_v2: zero output blinding is not allowed for positive-value notes",
+            ));
+        }
         let commitment_fr = poseidon_commit_spend(
             Fr::from(out.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -404,7 +423,11 @@ pub fn mint_to_asset(mint_hex: &str) -> Result<String, JsValue> {
 /// Derive the v3 spend public key `Poseidon1(privkey)` (circom Poseidon).
 #[wasm_bindgen]
 pub fn v3_note_pubkey(privkey_hex: &str) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let privkey = hex32(privkey_hex)?;
+    if privkey == [0u8; 32] {
+        return Err(JsValue::from_str("v3_note_pubkey: zero spend key is not allowed"));
+    }
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
     Ok(hex::encode(fr_to_le_bytes_32(v3_pubkey(sk))))
 }
 
@@ -416,10 +439,24 @@ pub fn v3_note_commitment(
     pubkey_hex: &str,
     blinding_hex: &str,
 ) -> Result<String, JsValue> {
+    let pubkey = hex32(pubkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    if amount > 0 {
+        if pubkey == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "v3_note_commitment: zero output pubkey is not allowed for positive-value notes",
+            ));
+        }
+        if blinding == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "v3_note_commitment: zero output blinding is not allowed for positive-value notes",
+            ));
+        }
+    }
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
         Fr::from(0u64), // NATIVE_SOL
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -436,10 +473,24 @@ pub fn v3_note_commitment_asset(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
+    let pubkey = hex32(pubkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    if amount > 0 {
+        if pubkey == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "v3_note_commitment_asset: zero output pubkey is not allowed for positive-value notes",
+            ));
+        }
+        if blinding == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "v3_note_commitment_asset: zero output blinding is not allowed for positive-value notes",
+            ));
+        }
+    }
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -521,6 +572,11 @@ pub fn prove_transact(
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
         let blinding = hex32(&inp.blinding_hex)?;
+        if inp.amount > 0 && privkey == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transact: zero spend key is not allowed for positive-value notes",
+            ));
+        }
         if inp.path_hex.len() != TX_LEVELS {
             return Err(JsValue::from_str(&format!(
                 "input path must have {TX_LEVELS} siblings, got {}",
@@ -557,6 +613,16 @@ pub fn prove_transact(
     for outp in &outputs {
         let pubkey = hex32(&outp.pubkey_hex)?;
         let blinding = hex32(&outp.blinding_hex)?;
+        if outp.amount > 0 && pubkey == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transact: zero output pubkey is not allowed for positive-value notes",
+            ));
+        }
+        if outp.amount > 0 && blinding == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transact: zero output blinding is not allowed for positive-value notes",
+            ));
+        }
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),

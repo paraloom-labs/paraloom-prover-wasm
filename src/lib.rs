@@ -27,6 +27,11 @@ use privacy::poseidon::{
 };
 use sha2::{Digest, Sha256};
 
+/// Withdrawal fee in basis points (matches on-chain WITHDRAWAL_FEE_BPS).
+const WITHDRAWAL_FEE_BPS: u64 = 25;
+/// Maximum on-chain withdrawal gross: u64::MAX / WITHDRAWAL_FEE_BPS.
+const MAX_ONCHAIN_WITHDRAWAL_GROSS: u64 = u64::MAX / WITHDRAWAL_FEE_BPS;
+
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut v = fr.into_bigint().to_bytes_le();
     v.resize(32, 0);
@@ -179,6 +184,19 @@ pub fn prove_withdrawal_v2(
     let asset_id = hex32(asset_id_hex)?;
     let dest_recipient = hex32(dest_recipient_hex)?;
 
+    // Recipient must not be all-zero on withdrawals.
+    if dest_recipient == [0u8; 32] {
+        return Err(JsValue::from_str(
+            "prove_withdrawal_v2: recipient must not be all-zero on withdrawals",
+        ));
+    }
+    // Enforce on-chain WITHDRAWAL_FEE_BPS overflow bound.
+    if amount > MAX_ONCHAIN_WITHDRAWAL_GROSS {
+        return Err(JsValue::from_str(
+            "prove_withdrawal_v2: withdrawal amount exceeds on-chain fee bound",
+        ));
+    }
+
     let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
         .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
     let indices: Vec<bool> = serde_json::from_str(indices_json)
@@ -298,6 +316,24 @@ pub fn prove_transfer_v2(
         return Err(JsValue::from_str(
             "transfer requires exactly 2 inputs and 2 outputs",
         ));
+    }
+
+    // Require at least one non-zero input note.
+    if inputs[0].amount == 0 && inputs[1].amount == 0 {
+        return Err(JsValue::from_str(
+            "prove_transfer_v2: at least one input note must be non-zero",
+        ));
+    }
+
+    // Distinct leaf_index when both inputs are non-zero.
+    if inputs[0].amount > 0 && inputs[1].amount > 0 {
+        let li0 = leaf_index_from(&inputs[0].indices);
+        let li1 = leaf_index_from(&inputs[1].indices);
+        if li0 == li1 {
+            return Err(JsValue::from_str(
+                "prove_transfer_v2: duplicate active leaf_index",
+            ));
+        }
     }
 
     let mut nullifiers = Vec::with_capacity(2);
@@ -500,12 +536,52 @@ pub fn prove_transact(
     let root = hex32(root_hex)?;
     let recipient = hex32(recipient_hex)?;
 
+    // Recipient binding: withdrawals (ext_amount < 0) must have non-zero recipient;
+    // pure shielded transfers (ext_amount == 0) must have all-zero recipient.
+    if ext_amount < 0 {
+        if recipient == [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transact: recipient must not be all-zero on withdrawals",
+            ));
+        }
+        // Enforce on-chain WITHDRAWAL_FEE_BPS overflow bound.
+        let gross = ext_amount.unsigned_abs();
+        if gross > MAX_ONCHAIN_WITHDRAWAL_GROSS {
+            return Err(JsValue::from_str(
+                "prove_transact: withdrawal amount exceeds on-chain fee bound",
+            ));
+        }
+    } else {
+        // ext_amount == 0: pure shielded transfer
+        if recipient != [0u8; 32] {
+            return Err(JsValue::from_str(
+                "prove_transact: recipient must be all-zero on pure shielded transfers",
+            ));
+        }
+    }
+
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
         .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
         .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
     if inputs.len() != 2 || outputs.len() != 2 {
         return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
+    }
+
+    // Require at least one non-zero input note.
+    if inputs[0].amount == 0 && inputs[1].amount == 0 {
+        return Err(JsValue::from_str(
+            "prove_transact: at least one input note must be non-zero",
+        ));
+    }
+
+    // Distinct leaf_index when both inputs are non-zero.
+    if inputs[0].amount > 0 && inputs[1].amount > 0 {
+        if inputs[0].leaf_index == inputs[1].leaf_index {
+            return Err(JsValue::from_str(
+                "prove_transact: duplicate active leaf_index",
+            ));
+        }
     }
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for

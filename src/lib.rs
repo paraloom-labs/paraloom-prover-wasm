@@ -217,8 +217,12 @@ pub fn prove_withdrawal_v2(
         input_path: Some(merkle_path),
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+    let mut cursor = proving_key;
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    if !cursor.is_empty() {
+        return Err(JsValue::from_str("bad proving key: trailing bytes"));
+    }
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -358,8 +362,12 @@ pub fn prove_transfer_v2(
         asset_id,
     );
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+    let mut cursor = proving_key;
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    if !cursor.is_empty() {
+        return Err(JsValue::from_str("bad proving key: trailing bytes"));
+    }
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -602,8 +610,12 @@ pub fn prove_transact(
         out_blindings,
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+    let mut cursor = proving_key;
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    if !cursor.is_empty() {
+        return Err(JsValue::from_str("bad proving key: trailing bytes"));
+    }
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -688,4 +700,52 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_groth16::Groth16;
+    use ark_relations::r1cs::{
+        ConstraintSynthesizer, ConstraintSystemRef, LinearCombination, Result as R1csResult,
+    };
+    use ark_snark::CircuitSpecificSetupSNARK;
+
+    struct DummyCircuit;
+    impl ConstraintSynthesizer<Fr> for DummyCircuit {
+        fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> R1csResult<()> {
+            let a = cs.new_witness_variable(|| Ok(Fr::from(1u32)))?;
+            let b = cs.new_witness_variable(|| Ok(Fr::from(1u32)))?;
+            let c = cs.new_input_variable(|| Ok(Fr::from(1u32)))?;
+            cs.enforce_constraint(
+                LinearCombination::from(a),
+                LinearCombination::from(b),
+                LinearCombination::from(c),
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn proving_key_deserialization_detects_trailing_bytes() {
+        let mut rng = StdRng::seed_from_u64(0x42);
+        let (pk, _) = Groth16::<Bn254>::setup(DummyCircuit, &mut rng).unwrap();
+        let mut bytes = Vec::new();
+        pk.serialize_compressed(&mut bytes).unwrap();
+
+        // Exact bytes: cursor is exhausted.
+        let mut cursor = &bytes[..];
+        let res = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor);
+        assert!(res.is_ok());
+        assert!(cursor.is_empty());
+
+        // Appending trailing bytes: deserializes successfully but leaves trailing bytes in cursor.
+        let mut with_trailing = bytes.clone();
+        with_trailing.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let mut cursor = &with_trailing[..];
+        let res = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor);
+        assert!(res.is_ok());
+        assert!(!cursor.is_empty());
+        assert_eq!(cursor, &[0xde, 0xad, 0xbe, 0xef]);
+    }
 }

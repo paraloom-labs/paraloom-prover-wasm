@@ -45,6 +45,76 @@ fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
     Ok(o)
 }
 
+fn ensure_nonzero_root(root: &[u8; 32]) -> Result<(), String> {
+    if root == &[0u8; 32] {
+        return Err("merkle root cannot be all-zero".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_nonzero_bytes32(bytes: &[u8; 32], label: &str) -> Result<(), String> {
+    if bytes == &[0u8; 32] {
+        return Err(format!("{label} cannot be all-zero"));
+    }
+    Ok(())
+}
+
+fn validate_two_note_balance_and_blindings(
+    in_amounts: [u64; 2],
+    in_privkeys: [[u8; 32]; 2],
+    in_blindings: [[u8; 32]; 2],
+    out_amounts: [u64; 2],
+    out_blindings: [[u8; 32]; 2],
+    ext_amount: i64,
+) -> Result<(), String> {
+    if ext_amount > 0 {
+        return Err("positive ext_amount: deposits go through deposit_note, not transact".to_string());
+    }
+    if ext_amount == i64::MIN {
+        return Err("ext_amount cannot be i64::MIN".to_string());
+    }
+    let in_sum = in_amounts[0]
+        .checked_add(in_amounts[1])
+        .ok_or_else(|| "input note amounts overflow u64".to_string())?;
+    let out_sum = out_amounts[0]
+        .checked_add(out_amounts[1])
+        .ok_or_else(|| "output note amounts overflow u64".to_string())?;
+    let expected_out = if ext_amount < 0 {
+        in_sum
+            .checked_sub(ext_amount.unsigned_abs())
+            .ok_or_else(|| "withdrawal amount exceeds input note sum".to_string())?
+    } else {
+        in_sum
+    };
+    if expected_out != out_sum {
+        return Err("unbalanced note amounts: sum(inputs) + ext_amount != sum(outputs)".to_string());
+    }
+
+    ensure_nonzero_bytes32(&in_privkeys[0], "input[0] privkey")?;
+    ensure_nonzero_bytes32(&in_privkeys[1], "input[1] privkey")?;
+    ensure_nonzero_bytes32(&in_blindings[0], "input[0] blinding")?;
+    ensure_nonzero_bytes32(&in_blindings[1], "input[1] blinding")?;
+    ensure_nonzero_bytes32(&out_blindings[0], "output[0] blinding")?;
+    ensure_nonzero_bytes32(&out_blindings[1], "output[1] blinding")?;
+
+    if in_blindings[0] == in_blindings[1] {
+        return Err("input notes cannot share the same blinding".to_string());
+    }
+    if out_blindings[0] == out_blindings[1] {
+        return Err("output notes cannot share the same blinding".to_string());
+    }
+    for (i, ib) in in_blindings.iter().enumerate() {
+        for (j, ob) in out_blindings.iter().enumerate() {
+            if ib == ob {
+                return Err(format!(
+                    "input[{i}] and output[{j}] cannot share the same blinding"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
 /// wallet needs this to look up the note's Merkle path from the path server.
 #[wasm_bindgen]
@@ -174,6 +244,7 @@ pub fn prove_withdrawal_v2(
     indices_json: &str,
 ) -> Result<String, JsValue> {
     let root = hex32(root_hex)?;
+    ensure_nonzero_root(&root).map_err(|e| JsValue::from_str(&e))?;
     let blinding = hex32(blinding_hex)?;
     let privkey = hex32(privkey_hex)?;
     let asset_id = hex32(asset_id_hex)?;
@@ -287,6 +358,7 @@ pub fn prove_transfer_v2(
     outputs_json: &str,
 ) -> Result<String, JsValue> {
     let root = hex32(root_hex)?;
+    ensure_nonzero_root(&root).map_err(|e| JsValue::from_str(&e))?;
     let asset_id = hex32(asset_id_hex)?;
     let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
 
@@ -348,15 +420,27 @@ pub fn prove_transfer_v2(
         root,
         nullifiers.clone(),
         output_commitments.clone(),
-        input_values,
-        input_blindings,
-        input_privkeys,
+        input_values.clone(),
+        input_blindings.clone(),
+        input_privkeys.clone(),
         input_paths,
-        output_values,
-        output_blindings,
+        output_values.clone(),
+        output_blindings.clone(),
         output_pubkeys,
         asset_id,
     );
+    validate_two_note_balance_and_blindings(
+        [input_values[0], input_values[1]],
+        [input_privkeys[0], input_privkeys[1]],
+        [input_blindings[0], input_blindings[1]],
+        [output_values[0], output_values[1]],
+        [output_blindings[0], output_blindings[1]],
+        0,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    if nullifiers[0] == nullifiers[1] {
+        return Err(JsValue::from_str("duplicate input nullifier"));
+    }
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
@@ -498,6 +582,7 @@ pub fn prove_transact(
         ));
     }
     let root = hex32(root_hex)?;
+    ensure_nonzero_root(&root).map_err(|e| JsValue::from_str(&e))?;
     let recipient = hex32(recipient_hex)?;
 
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
@@ -567,6 +652,19 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+    }
+
+    validate_two_note_balance_and_blindings(
+        [inputs[0].amount, inputs[1].amount],
+        [in_privkeys[0].unwrap(), in_privkeys[1].unwrap()],
+        [in_blindings[0].unwrap(), in_blindings[1].unwrap()],
+        [outputs[0].amount, outputs[1].amount],
+        [out_blindings[0].unwrap(), out_blindings[1].unwrap()],
+        ext_amount,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    if nullifiers[0] == nullifiers[1] {
+        return Err(JsValue::from_str("duplicate input nullifier"));
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =
@@ -688,4 +786,136 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod sum_overflow_and_blinding_guard_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_all_zero_merkle_root() {
+        assert!(ensure_nonzero_root(&[0u8; 32]).is_err());
+        let mut r = [0u8; 32];
+        r[0] = 1;
+        assert!(ensure_nonzero_root(&r).is_ok());
+    }
+
+    #[test]
+    fn rejects_u64_sum_overflow_on_inputs_and_outputs() {
+        let sk0 = [1u8; 32];
+        let sk1 = [2u8; 32];
+        let ib0 = [3u8; 32];
+        let ib1 = [4u8; 32];
+        let ob0 = [5u8; 32];
+        let ob1 = [6u8; 32];
+
+        // Input sum overflows u64
+        assert!(validate_two_note_balance_and_blindings(
+            [u64::MAX, 1],
+            [sk0, sk1],
+            [ib0, ib1],
+            [u64::MAX, 1],
+            [ob0, ob1],
+            0,
+        )
+        .is_err());
+
+        // Output sum overflows u64
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, sk1],
+            [ib0, ib1],
+            [u64::MAX, 2],
+            [ob0, ob1],
+            0,
+        )
+        .is_err());
+
+        // Valid balanced 2-note transfer with distinct non-zero blindings/privkeys
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, sk1],
+            [ib0, ib1],
+            [400, 100],
+            [ob0, ob1],
+            -500,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_or_reused_blindings_and_privkeys_on_dummy_notes() {
+        let sk0 = [1u8; 32];
+        let sk1 = [2u8; 32];
+        let ib0 = [3u8; 32];
+        let ib1 = [4u8; 32];
+        let ob0 = [5u8; 32];
+        let ob1 = [6u8; 32];
+
+        // Dummy input (amount == 0) with all-zero privkey
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, [0u8; 32]],
+            [ib0, ib1],
+            [1_000, 0],
+            [ob0, ob1],
+            0,
+        )
+        .is_err());
+
+        // Dummy input (amount == 0) with all-zero blinding
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, sk1],
+            [ib0, [0u8; 32]],
+            [1_000, 0],
+            [ob0, ob1],
+            0,
+        )
+        .is_err());
+
+        // Filler output (amount == 0) with all-zero blinding
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, sk1],
+            [ib0, ib1],
+            [1_000, 0],
+            [ob0, [0u8; 32]],
+            0,
+        )
+        .is_err());
+
+        // Reused blinding across inputs
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, sk1],
+            [ib0, ib0],
+            [1_000, 0],
+            [ob0, ob1],
+            0,
+        )
+        .is_err());
+
+        // Reused blinding across outputs (including zero-value filler outputs)
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, sk1],
+            [ib0, ib1],
+            [0, 0],
+            [ob0, ob0],
+            -1_000,
+        )
+        .is_err());
+
+        // Reused blinding between input and output
+        assert!(validate_two_note_balance_and_blindings(
+            [1_000, 0],
+            [sk0, sk1],
+            [ib0, ib1],
+            [1_000, 0],
+            [ib0, ob1],
+            0,
+        )
+        .is_err());
+    }
 }

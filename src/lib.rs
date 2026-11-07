@@ -45,6 +45,87 @@ fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
     Ok(o)
 }
 
+fn validate_v1_note_commitment_inputs(
+    amount: u64,
+    randomness: &[u8; 32],
+    recipient: &[u8; 32],
+) -> Result<(), String> {
+    if amount == 0 {
+        return Err("note_commitment: amount must be non-zero".to_string());
+    }
+    if randomness == &[0u8; 32] {
+        return Err("note_commitment: randomness cannot be all-zero".to_string());
+    }
+    if recipient == &[0u8; 32] {
+        return Err("note_commitment: recipient cannot be all-zero".to_string());
+    }
+    Ok(())
+}
+
+fn validate_v2_note_commitment_inputs(
+    amount: u64,
+    privkey: &[u8; 32],
+    blinding: &[u8; 32],
+) -> Result<(), String> {
+    if amount == 0 {
+        return Err("note_commitment_v2: amount must be non-zero".to_string());
+    }
+    if privkey == &[0u8; 32] {
+        return Err("note_commitment_v2: privkey cannot be all-zero".to_string());
+    }
+    if blinding == &[0u8; 32] {
+        return Err("note_commitment_v2: blinding cannot be all-zero".to_string());
+    }
+    Ok(())
+}
+
+fn validate_v2_withdrawal_inputs(
+    amount: u64,
+    privkey: &[u8; 32],
+    blinding: &[u8; 32],
+    dest_recipient: &[u8; 32],
+    path_len: usize,
+    indices_len: usize,
+) -> Result<(), String> {
+    if amount == 0 {
+        return Err("prove_withdrawal_v2: amount must be non-zero".to_string());
+    }
+    if privkey == &[0u8; 32] {
+        return Err("prove_withdrawal_v2: privkey cannot be all-zero".to_string());
+    }
+    if blinding == &[0u8; 32] {
+        return Err("prove_withdrawal_v2: blinding cannot be all-zero".to_string());
+    }
+    if dest_recipient == &[0u8; 32] {
+        return Err("prove_withdrawal_v2: dest_recipient cannot be all-zero".to_string());
+    }
+    if path_len != indices_len {
+        return Err("path and indices length mismatch".to_string());
+    }
+    if path_len == 0 || path_len > 63 {
+        return Err("prove_withdrawal_v2: merkle path depth must be in 1..=63".to_string());
+    }
+    Ok(())
+}
+
+fn validate_v2_transfer_path_depths(
+    path0_len: usize,
+    idx0_len: usize,
+    path1_len: usize,
+    idx1_len: usize,
+) -> Result<(), String> {
+    if path0_len != idx0_len || path1_len != idx1_len {
+        return Err("path and indices length mismatch".to_string());
+    }
+    if path0_len == 0 || path0_len > 63 {
+        return Err("prove_transfer_v2: merkle path depth must be in 1..=63".to_string());
+    }
+    if path0_len != path1_len {
+        return Err("prove_transfer_v2: input merkle paths must have the same depth".to_string());
+    }
+    Ok(())
+}
+
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
 /// wallet needs this to look up the note's Merkle path from the path server.
 #[wasm_bindgen]
@@ -55,6 +136,8 @@ pub fn note_commitment(
 ) -> Result<String, JsValue> {
     let randomness = hex32(randomness_hex)?;
     let recipient = hex32(recipient_hex)?;
+    validate_v1_note_commitment_inputs(amount, &randomness, &recipient)
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = poseidon_commit(
         Fr::from(amount),
         Fr::from_le_bytes_mod_order(&randomness),
@@ -96,12 +179,17 @@ pub fn note_commitment_v2(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let privkey = hex32(privkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    let asset_id = hex32(asset_id_hex)?;
+    validate_v2_note_commitment_inputs(amount, &privkey, &blinding)
+        .map_err(|e| JsValue::from_str(&e))?;
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
     let c = poseidon_commit_spend(
         Fr::from(amount),
         poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        Fr::from_le_bytes_mod_order(&blinding),
+        Fr::from_le_bytes_mod_order(&asset_id),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -183,6 +271,15 @@ pub fn prove_withdrawal_v2(
         .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
     let indices: Vec<bool> = serde_json::from_str(indices_json)
         .map_err(|e| JsValue::from_str(&format!("bad indices json: {e}")))?;
+    validate_v2_withdrawal_inputs(
+        amount,
+        &privkey,
+        &blinding,
+        &dest_recipient,
+        path_hex.len(),
+        indices.len(),
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
     let merkle_path = merkle_path_from(&path_hex, &indices)?;
 
     let leaf_index = leaf_index_from(&indices);
@@ -299,6 +396,13 @@ pub fn prove_transfer_v2(
             "transfer requires exactly 2 inputs and 2 outputs",
         ));
     }
+    validate_v2_transfer_path_depths(
+        inputs[0].path_hex.len(),
+        inputs[0].indices.len(),
+        inputs[1].path_hex.len(),
+        inputs[1].indices.len(),
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     let mut nullifiers = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
@@ -688,4 +792,40 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod v1_v2_commitment_and_path_depth_tests {
+    use super::*;
+
+    #[test]
+    fn v1_and_v2_note_commitment_validators_reject_zero_amount_and_zero_keys() {
+        let nz = [1u8; 32];
+        assert!(validate_v1_note_commitment_inputs(100, &nz, &nz).is_ok());
+        assert!(validate_v1_note_commitment_inputs(0, &nz, &nz).is_err());
+        assert!(validate_v1_note_commitment_inputs(100, &[0u8; 32], &nz).is_err());
+        assert!(validate_v1_note_commitment_inputs(100, &nz, &[0u8; 32]).is_err());
+
+        assert!(validate_v2_note_commitment_inputs(100, &nz, &nz).is_ok());
+        assert!(validate_v2_note_commitment_inputs(0, &nz, &nz).is_err());
+        assert!(validate_v2_note_commitment_inputs(100, &[0u8; 32], &nz).is_err());
+        assert!(validate_v2_note_commitment_inputs(100, &nz, &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn v2_withdrawal_and_transfer_path_depth_validators_reject_invalid_inputs() {
+        let nz = [2u8; 32];
+        assert!(validate_v2_withdrawal_inputs(500, &nz, &nz, &nz, 32, 32).is_ok());
+        assert!(validate_v2_withdrawal_inputs(0, &nz, &nz, &nz, 32, 32).is_err());
+        assert!(validate_v2_withdrawal_inputs(500, &[0u8; 32], &nz, &nz, 32, 32).is_err());
+        assert!(validate_v2_withdrawal_inputs(500, &nz, &[0u8; 32], &nz, 32, 32).is_err());
+        assert!(validate_v2_withdrawal_inputs(500, &nz, &nz, &[0u8; 32], 32, 32).is_err());
+        assert!(validate_v2_withdrawal_inputs(500, &nz, &nz, &nz, 0, 0).is_err());
+        assert!(validate_v2_withdrawal_inputs(500, &nz, &nz, &nz, 64, 64).is_err());
+
+        assert!(validate_v2_transfer_path_depths(32, 32, 32, 32).is_ok());
+        assert!(validate_v2_transfer_path_depths(32, 32, 16, 16).is_err());
+        assert!(validate_v2_transfer_path_depths(0, 0, 0, 0).is_err());
+        assert!(validate_v2_transfer_path_depths(64, 64, 64, 64).is_err());
+    }
 }

@@ -10,8 +10,11 @@
 //! system the validators verify.
 
 pub mod privacy;
+pub mod transact_vk_data;
 
-use ark_bn254::{Bn254, Fr};
+use ark_bn254::{Bn254, Fr, G1Affine, G2Affine};
+use ark_ec::pairing::Pairing;
+use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -35,14 +38,180 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
+pub fn js_err(msg: impl AsRef<str>) -> JsValue {
+    #[cfg(target_family = "wasm")]
+    {
+        JsValue::from_str(msg.as_ref())
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let _ = msg;
+        JsValue::NULL
+    }
+}
+
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+    let b = hex::decode(s.trim()).map_err(|e| js_err(format!("bad hex: {e}")))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err(js_err("expected 32-byte hex"));
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+/// Reverse a 32-byte coordinate (little-endian <-> big-endian).
+fn rev32(src: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, b) in src.iter().take(32).rev().enumerate() {
+        out[i] = *b;
+    }
+    out
+}
+
+/// G1 point -> 64-byte big-endian `[x || y]`, matching on-chain wire format.
+pub fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
+    let mut le = Vec::with_capacity(64);
+    p.serialize_uncompressed(&mut le)
+        .expect("G1 serialize_uncompressed is infallible for valid point");
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&rev32(&le[..32]));
+    out[32..].copy_from_slice(&rev32(&le[32..64]));
+    out
+}
+
+/// G2 point -> 128-byte big-endian `[x.c1 || x.c0 || y.c1 || y.c0]`, matching on-chain wire format.
+pub fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
+    let mut le = Vec::with_capacity(128);
+    p.serialize_uncompressed(&mut le)
+        .expect("G2 serialize_uncompressed is infallible for valid point");
+    let mut out = [0u8; 128];
+    out[..32].copy_from_slice(&rev32(&le[32..64]));
+    out[32..64].copy_from_slice(&rev32(&le[..32]));
+    out[64..96].copy_from_slice(&rev32(&le[96..128]));
+    out[96..].copy_from_slice(&rev32(&le[64..96]));
+    out
+}
+
+/// Verify that a Groth16 verifying key matches the pinned on-chain ceremony VK constants.
+pub fn verify_transact_ceremony_vk(vk: &ark_groth16::VerifyingKey<Bn254>) -> Result<(), String> {
+    use transact_vk_data::*;
+
+    if vk.gamma_abc_g1.len() != VK_IC.len() {
+        return Err(format!(
+            "verifying key IC count mismatch: expected {}, got {}",
+            VK_IC.len(),
+            vk.gamma_abc_g1.len()
+        ));
+    }
+
+    if g1_to_wire(&vk.alpha_g1) != VK_ALPHA_G1 {
+        return Err("verifying key alpha_g1 does not match on-chain ceremony VK".to_string());
+    }
+    if g2_to_wire(&vk.beta_g2) != VK_BETA_G2 {
+        return Err("verifying key beta_g2 does not match on-chain ceremony VK".to_string());
+    }
+    if g2_to_wire(&vk.gamma_g2) != VK_GAMMA_G2 {
+        return Err("verifying key gamma_g2 does not match on-chain ceremony VK".to_string());
+    }
+    if g2_to_wire(&vk.delta_g2) != VK_DELTA_G2 {
+        return Err("verifying key delta_g2 does not match on-chain ceremony VK".to_string());
+    }
+
+    for (i, (ic_point, expected_ic)) in vk.gamma_abc_g1.iter().zip(VK_IC.iter()).enumerate() {
+        if &g1_to_wire(ic_point) != expected_ic {
+            return Err(format!(
+                "verifying key IC[{i}] does not match on-chain ceremony VK"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate that a proving key does not contain degenerate points, empty queries,
+/// or toxic-waste collisions, and that cross-group pairings are consistent.
+pub fn validate_proving_key(pk: &ProvingKey<Bn254>) -> Result<(), String> {
+    // 1. Degenerate / zero (infinity) points
+    if pk.vk.alpha_g1.is_zero() {
+        return Err("degenerate proving key: alpha_g1 is point at infinity".to_string());
+    }
+    if pk.vk.beta_g2.is_zero() {
+        return Err("degenerate proving key: beta_g2 is point at infinity".to_string());
+    }
+    if pk.vk.gamma_g2.is_zero() {
+        return Err("degenerate proving key: gamma_g2 is point at infinity".to_string());
+    }
+    if pk.vk.delta_g2.is_zero() {
+        return Err("degenerate proving key: delta_g2 is point at infinity".to_string());
+    }
+    if pk.beta_g1.is_zero() {
+        return Err("degenerate proving key: beta_g1 is point at infinity".to_string());
+    }
+    if pk.delta_g1.is_zero() {
+        return Err("degenerate proving key: delta_g1 is point at infinity".to_string());
+    }
+
+    if pk.vk.gamma_abc_g1.is_empty() {
+        return Err("degenerate proving key: gamma_abc_g1 is empty".to_string());
+    }
+    for (i, p) in pk.vk.gamma_abc_g1.iter().enumerate() {
+        if p.is_zero() {
+            return Err(format!(
+                "degenerate proving key: gamma_abc_g1[{i}] is point at infinity"
+            ));
+        }
+    }
+
+    // 2. Query vectors non-empty and query length consistency
+    if pk.a_query.is_empty() {
+        return Err("degenerate proving key: a_query is empty".to_string());
+    }
+    if pk.b_g1_query.is_empty() {
+        return Err("degenerate proving key: b_g1_query is empty".to_string());
+    }
+    if pk.b_g2_query.is_empty() {
+        return Err("degenerate proving key: b_g2_query is empty".to_string());
+    }
+    if pk.b_g1_query.len() != pk.b_g2_query.len() {
+        return Err(
+            "degenerate proving key: b_g1_query and b_g2_query length mismatch".to_string(),
+        );
+    }
+    if pk.h_query.is_empty() {
+        return Err("degenerate proving key: h_query is empty".to_string());
+    }
+
+    // 3. Toxic-waste collisions between trapdoor powers
+    if pk.beta_g1 == pk.delta_g1 {
+        return Err("toxic-waste collision: beta_g1 == delta_g1".to_string());
+    }
+    if pk.vk.alpha_g1 == pk.beta_g1 {
+        return Err("toxic-waste collision: alpha_g1 == beta_g1".to_string());
+    }
+    if pk.vk.alpha_g1 == pk.delta_g1 {
+        return Err("toxic-waste collision: alpha_g1 == delta_g1".to_string());
+    }
+    if pk.vk.beta_g2 == pk.vk.delta_g2 {
+        return Err("toxic-waste collision: beta_g2 == delta_g2".to_string());
+    }
+    if pk.vk.beta_g2 == pk.vk.gamma_g2 {
+        return Err("toxic-waste collision: beta_g2 == gamma_g2".to_string());
+    }
+    if pk.vk.gamma_g2 == pk.vk.delta_g2 {
+        return Err("toxic-waste collision: gamma_g2 == delta_g2".to_string());
+    }
+
+    // 4. Cross-group pairing consistency for beta and delta across G1 and G2:
+    // e(beta_g1, delta_g2) == e(delta_g1, beta_g2)
+    if Bn254::pairing(pk.beta_g1, pk.vk.delta_g2) != Bn254::pairing(pk.delta_g1, pk.vk.beta_g2) {
+        return Err(
+            "degenerate proving key: cross-group pairing mismatch between beta and delta"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -218,15 +387,16 @@ pub fn prove_withdrawal_v2(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(format!("bad proving key: {e}")))?;
+    validate_proving_key(&pk).map_err(js_err)?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(format!("serialize failed: {e}")))?;
 
     Ok(format!(
         "{{\"nullifier\":\"{}\",\"proof\":\"{}\"}}",
@@ -359,15 +529,16 @@ pub fn prove_transfer_v2(
     );
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(format!("bad proving key: {e}")))?;
+    validate_proving_key(&pk).map_err(js_err)?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(format!("serialize failed: {e}")))?;
 
     let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
@@ -603,15 +774,17 @@ pub fn prove_transact(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(format!("bad proving key: {e}")))?;
+    validate_proving_key(&pk).map_err(js_err)?;
+    verify_transact_ceremony_vk(&pk.vk).map_err(js_err)?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(format!("serialize failed: {e}")))?;
 
     // The L2 carries `tag(1) || body`. Nodes split the envelope and reject an
     // unknown suite rather than assuming the one they happen to embed, so an
@@ -642,18 +815,29 @@ pub fn prove_transact(
 ///
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
-#[wasm_bindgen]
-pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
+fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
+    let b = hex::decode(s.trim()).map_err(|e| format!("bad hex: {e}"))?;
+    if b.len() != 32 {
+        return Err("expected 32-byte hex".to_string());
+    }
+    let mut o = [0u8; 32];
+    o.copy_from_slice(&b);
+    Ok(o)
+}
+
+/// Internal Rust implementation of `v3_merkle_path`.
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
+pub fn v3_merkle_path_inner(leaves_json: &str, leaf_index: u32) -> Result<String, String> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
-    let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
-        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
+    let leaves_hex: Vec<String> =
+        serde_json::from_str(leaves_json).map_err(|e| format!("bad leaves json: {e}"))?;
     if (leaf_index as usize) >= leaves_hex.len() {
-        return Err(JsValue::from_str("leaf_index out of range"));
+        return Err("leaf_index out of range".to_string());
     }
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+        level.push(Fr::from_le_bytes_mod_order(&parse_hex32(l)?));
     }
 
     // Zero-subtree hashes, as the on-chain tree pads with.
@@ -683,9 +867,34 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
     }
 
     let root = *level.first().unwrap_or(&zeros[TX_LEVELS]);
+
+    // Bit-fold self-verification: folding the target leaf along the computed
+    // path according to the direction bits of `leaf_index` must bit-identically
+    // yield `root`.
+    let target_leaf_bytes = parse_hex32(&leaves_hex[leaf_index as usize])?;
+    let mut fold_current = Fr::from_le_bytes_mod_order(&target_leaf_bytes);
+    for (depth, sib_hex) in path.iter().enumerate() {
+        let sib_bytes = parse_hex32(sib_hex)?;
+        let sibling_fr = Fr::from_le_bytes_mod_order(&sib_bytes);
+        let bit = ((leaf_index as u64) >> depth) & 1;
+        fold_current = if bit == 0 {
+            v3_merkle_pair(fold_current, sibling_fr)
+        } else {
+            v3_merkle_pair(sibling_fr, fold_current)
+        };
+    }
+    if fold_current != root {
+        return Err("merkle path bit-fold self-verification failed".to_string());
+    }
+
     Ok(format!(
         "{{\"path\":{},\"root\":\"{}\"}}",
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[wasm_bindgen]
+pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
+    v3_merkle_path_inner(leaves_json, leaf_index).map_err(js_err)
 }

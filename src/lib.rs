@@ -35,14 +35,18 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
-fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
-    if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+fn parse_hex32_str(s: &str) -> Result<[u8; 32], String> {
+    if s.len() != 64 {
+        return Err("expected 32-byte hex (64 characters without whitespace or prefix)".to_string());
     }
+    let b = hex::decode(s).map_err(|e| format!("bad hex: {e}"))?;
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
+    parse_hex32_str(s).map_err(|e| JsValue::from_str(&e))
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -106,10 +110,14 @@ pub fn note_commitment_v2(
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
 
-fn rng_from_entropy() -> StdRng {
+fn rng_from_entropy_inner() -> Result<StdRng, String> {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("browser entropy");
-    StdRng::from_seed(seed)
+    getrandom::getrandom(&mut seed).map_err(|e| format!("browser entropy unavailable: {e}"))?;
+    Ok(StdRng::from_seed(seed))
+}
+
+fn rng_from_entropy() -> Result<StdRng, JsValue> {
+    rng_from_entropy_inner().map_err(|e| JsValue::from_str(&e))
 }
 
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
@@ -219,8 +227,9 @@ pub fn prove_withdrawal_v2(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let mut rng = rng_from_entropy()?;
     let proof =
-        Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
+        Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng)
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
@@ -239,6 +248,7 @@ pub fn prove_withdrawal_v2(
 /// root-less Merkle path proving the note's commitment is in the tree, pulled
 /// from the path server.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransferInputV2 {
     amount: u64,
     /// The note's spend key. Authority is knowledge of this, not of a free
@@ -254,6 +264,7 @@ struct TransferInputV2 {
 
 /// An output note being created. A value-0 note is a valid "empty" output.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransferOutputV2 {
     amount: u64,
     /// The recipient's spend *public* key, `Poseidon(privkey)`.
@@ -360,8 +371,9 @@ pub fn prove_transfer_v2(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let mut rng = rng_from_entropy()?;
     let proof =
-        Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
+        Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng)
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
@@ -451,6 +463,7 @@ pub fn v3_note_commitment_asset(
 /// needed. A padding input has `amount: 0` (membership is skipped in-circuit
 /// for zero-value notes) with any well-formed path, e.g. all-zero siblings.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransactInputNote {
     amount: u64,
     privkey_hex: String,
@@ -461,6 +474,7 @@ struct TransactInputNote {
 
 /// An output note being created. A value-0 note is a valid "empty" output.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransactOutputNote {
     amount: u64,
     pubkey_hex: String,
@@ -604,8 +618,9 @@ pub fn prove_transact(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let mut rng = rng_from_entropy()?;
     let proof =
-        Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
+        Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng)
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
@@ -688,4 +703,68 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod hex_and_schema_guard_tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex32_str_rejects_whitespace_padding_and_prefixes() {
+        let valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(parse_hex32_str(valid).is_ok());
+        assert!(parse_hex32_str(&valid.to_uppercase()).is_ok());
+
+        for bad in [
+            format!(" {valid}"),
+            format!("{valid} "),
+            format!("\t{valid}"),
+            format!("{valid}\n"),
+            format!("\r\n{valid}"),
+            format!("\u{2003}{valid}"),
+            format!("0x{valid}"),
+            valid[..62].to_string(),
+            format!("{valid}00"),
+            String::new(),
+        ] {
+            assert!(
+                parse_hex32_str(&bad).is_err(),
+                "must reject non-canonical hex32 input: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn witness_structs_reject_unknown_or_cross_version_fields() {
+        let h = "11".repeat(32);
+
+        // TransactInputNote (v3) must reject v2 `indices` or misspelled fields.
+        let v3_in_bad = format!(
+            r#"{{"amount":100,"privkey_hex":"{h}","blinding_hex":"{h}","leaf_index":0,"path_hex":[],"indices":[true]}}"#
+        );
+        assert!(serde_json::from_str::<TransactInputNote>(&v3_in_bad).is_err());
+
+        // TransactOutputNote (v3) must reject unknown fields.
+        let v3_out_bad = format!(
+            r#"{{"amount":100,"pubkey_hex":"{h}","blinding_hex":"{h}","asset_id_hex":"{h}"}}"#
+        );
+        assert!(serde_json::from_str::<TransactOutputNote>(&v3_out_bad).is_err());
+
+        // TransferInputV2 (v2) must reject v3 `leaf_index`.
+        let v2_in_bad = format!(
+            r#"{{"amount":100,"privkey_hex":"{h}","blinding_hex":"{h}","path_hex":[],"indices":[],"leaf_index":0}}"#
+        );
+        assert!(serde_json::from_str::<TransferInputV2>(&v2_in_bad).is_err());
+
+        // TransferOutputV2 (v2) must reject unknown fields.
+        let v2_out_bad = format!(
+            r#"{{"amount":100,"pubkey_hex":"{h}","blinding_hex":"{h}","extra":1}}"#
+        );
+        assert!(serde_json::from_str::<TransferOutputV2>(&v2_out_bad).is_err());
+    }
+
+    #[test]
+    fn rng_from_entropy_inner_returns_seeded_rng() {
+        assert!(rng_from_entropy_inner().is_ok());
+    }
 }

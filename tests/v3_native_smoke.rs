@@ -106,11 +106,13 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
     );
 
     let recipient = [3u8; 32];
+    let native_asset = [0u8; 32];
     let out = prove_transact(
         &pk_bytes,
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&native_asset),
         &inputs,
         &outputs,
     )
@@ -246,6 +248,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );

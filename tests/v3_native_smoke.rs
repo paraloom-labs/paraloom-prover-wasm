@@ -111,6 +111,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     )
@@ -246,6 +247,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );
@@ -253,5 +255,49 @@ fn v3_merkle_path_output_proves_membership() {
         res.is_ok(),
         "a v3_merkle_path path must prove membership: {:?}",
         res.err()
+    );
+}
+
+#[test]
+fn prove_transact_rejects_duplicate_output_commitments() {
+    let z = hx(&[0u8; 32]);
+    let path_json = serde_json::to_string(&vec![z.clone(); 32]).unwrap();
+    let inputs = format!(
+        r#"[
+          {{"amount":1000,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}},
+          {{"amount":0,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":1,"path_hex":{path_json}}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(11u64))),
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(12u64))),
+        hx(&fr_to_le(&Fr::from(2u64))),
+    );
+    let opk = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(61u64)))).unwrap();
+    let dup_outputs = format!(
+        r#"[
+          {{"amount":500,"pubkey_hex":"{opk}","blinding_hex":"{}"}},
+          {{"amount":500,"pubkey_hex":"{opk}","blinding_hex":"{}"}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(1u64))),
+    );
+    assert!(
+        prove_transact(&[], &z, 0, &z, &z, &inputs, &dup_outputs).is_err(),
+        "prove_transact must reject duplicate output commitments"
+    );
+
+    // Output commitment colliding with an input commitment must also be rejected
+    let in_pk0 = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(11u64)))).unwrap();
+    let colliding_outputs = format!(
+        r#"[
+          {{"amount":1000,"pubkey_hex":"{in_pk0}","blinding_hex":"{}"}},
+          {{"amount":0,"pubkey_hex":"{opk}","blinding_hex":"{}"}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(9u64))),
+    );
+    assert!(
+        prove_transact(&[], &z, 0, &z, &z, &inputs, &colliding_outputs).is_err(),
+        "prove_transact must reject output commitment colliding with input commitment"
     );
 }

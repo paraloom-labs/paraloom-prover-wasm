@@ -18,7 +18,41 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use wasm_bindgen::prelude::*;
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
+
+fn deserialize_u64_or_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct U64OrStringVisitor;
+
+    impl<'de> de::Visitor<'de> for U64OrStringVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a u64 integer or canonical base-10 string")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value.is_empty()
+                || !value.bytes().all(|b| b.is_ascii_digit())
+                || (value.len() > 1 && value.starts_with('0'))
+            {
+                return Err(E::custom("invalid canonical base-10 u64 string"));
+            }
+            value.parse::<u64>().map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(U64OrStringVisitor)
+}
 
 use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
 use privacy::poseidon::{
@@ -183,6 +217,11 @@ pub fn prove_withdrawal_v2(
         .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
     let indices: Vec<bool> = serde_json::from_str(indices_json)
         .map_err(|e| JsValue::from_str(&format!("bad indices json: {e}")))?;
+    if path_hex.len() != TX_LEVELS || indices.len() != TX_LEVELS {
+        return Err(JsValue::from_str(&format!(
+            "withdrawal path and indices must have {TX_LEVELS} levels"
+        )));
+    }
     let merkle_path = merkle_path_from(&path_hex, &indices)?;
 
     let leaf_index = leaf_index_from(&indices);
@@ -240,6 +279,7 @@ pub fn prove_withdrawal_v2(
 /// from the path server.
 #[derive(Deserialize)]
 struct TransferInputV2 {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
     amount: u64,
     /// The note's spend key. Authority is knowledge of this, not of a free
     /// secret: it is folded into the nullifier through a signature over
@@ -255,10 +295,46 @@ struct TransferInputV2 {
 /// An output note being created. A value-0 note is a valid "empty" output.
 #[derive(Deserialize)]
 struct TransferOutputV2 {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
     amount: u64,
     /// The recipient's spend *public* key, `Poseidon(privkey)`.
     pubkey_hex: String,
     blinding_hex: String,
+}
+
+fn validate_transfer_v2_commitments_and_structure(
+    inputs: &[TransferInputV2],
+    outputs: &[TransferOutputV2],
+    input_commitments: &[[u8; 32]],
+    output_commitments: &[[u8; 32]],
+) -> Result<(), String> {
+    if inputs.len() != 2 || outputs.len() != 2 {
+        return Err("transfer requires exactly 2 inputs and 2 outputs".to_string());
+    }
+    for (idx, inp) in inputs.iter().enumerate() {
+        if inp.amount == 0 {
+            return Err(format!("prove_transfer_v2: input[{idx}] amount must be > 0"));
+        }
+        if inp.path_hex.len() != TX_LEVELS || inp.indices.len() != TX_LEVELS {
+            return Err(format!(
+                "prove_transfer_v2: input[{idx}] path and indices must have {TX_LEVELS} levels"
+            ));
+        }
+    }
+    if outputs[0].amount == 0 && outputs[1].amount == 0 {
+        return Err("prove_transfer_v2: at least one output note must have amount > 0".to_string());
+    }
+    if input_commitments[0] == input_commitments[1] {
+        return Err("prove_transfer_v2: duplicate input commitments".to_string());
+    }
+    for out_cm in output_commitments {
+        if input_commitments.contains(out_cm) {
+            return Err(
+                "prove_transfer_v2: output commitment collides with input commitment".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Build a shielded → shielded transfer proof with the spend-key construction
@@ -301,6 +377,7 @@ pub fn prove_transfer_v2(
     }
 
     let mut nullifiers = Vec::with_capacity(2);
+    let mut input_commitments = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
@@ -315,6 +392,7 @@ pub fn prove_transfer_v2(
             Fr::from_le_bytes_mod_order(&blinding),
             asset_fr,
         );
+        input_commitments.push(fr_to_le_bytes_32(commitment_fr));
         let leaf_index = leaf_index_from(&inp.indices);
         let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
         let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
@@ -343,6 +421,13 @@ pub fn prove_transfer_v2(
         output_blindings.push(blinding);
         output_pubkeys.push(pubkey);
     }
+    validate_transfer_v2_commitments_and_structure(
+        &inputs,
+        &outputs,
+        &input_commitments,
+        &output_commitments,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     let circuit = TransferCircuitV2::with_witness(
         root,
@@ -452,9 +537,11 @@ pub fn v3_note_commitment_asset(
 /// for zero-value notes) with any well-formed path, e.g. all-zero siblings.
 #[derive(Deserialize)]
 struct TransactInputNote {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
     amount: u64,
     privkey_hex: String,
     blinding_hex: String,
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
     leaf_index: u64,
     path_hex: Vec<String>,
 }
@@ -462,9 +549,35 @@ struct TransactInputNote {
 /// An output note being created. A value-0 note is a valid "empty" output.
 #[derive(Deserialize)]
 struct TransactOutputNote {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
     amount: u64,
     pubkey_hex: String,
     blinding_hex: String,
+}
+
+fn validate_transact_v3_commitments_and_structure(
+    ext_amount: i64,
+    inputs: &[TransactInputNote],
+    outputs: &[TransactOutputNote],
+    input_commitments: &[[u8; 32]],
+) -> Result<(), String> {
+    for (idx, inp) in inputs.iter().enumerate() {
+        if inp.amount == 0 && inp.leaf_index != 0 {
+            return Err(format!(
+                "prove_transact: zero-value dummy input[{idx}] must have leaf_index == 0"
+            ));
+        }
+    }
+    if ext_amount == 0 && outputs[0].amount == 0 && outputs[1].amount == 0 {
+        return Err(
+            "prove_transact: pure shielded transfer requires at least one non-zero output"
+                .to_string(),
+        );
+    }
+    if input_commitments[0] == input_commitments[1] {
+        return Err("prove_transact: duplicate input commitments".to_string());
+    }
+    Ok(())
 }
 
 /// Build a v3 unified transact proof entirely in the browser.
@@ -517,6 +630,7 @@ pub fn prove_transact(
     let mut in_blindings = Vec::new();
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
+    let mut in_commitments = Vec::new();
     let mut nullifiers = Vec::new();
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
@@ -539,6 +653,7 @@ pub fn prove_transact(
             Fr::from_le_bytes_mod_order(&blinding),
             asset,
         );
+        in_commitments.push(fr_to_le_bytes_32(c));
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
         nullifiers.push(fr_to_le_bytes_32(nf));
@@ -568,6 +683,13 @@ pub fn prove_transact(
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
     }
+    validate_transact_v3_commitments_and_structure(
+        ext_amount,
+        &inputs,
+        &outputs,
+        &in_commitments,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     // public_amount = the field encoding of the signed ext_amount (negative =
     // p − |ext_amount|), exactly as the program derives it on-chain.
@@ -688,4 +810,138 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod input_commitment_depth_and_u64_json_tests {
+    use super::*;
+
+    #[test]
+    fn u64_or_string_deserializes_large_u64_strings_and_rejects_malformed() {
+        let h = "01".repeat(32);
+        let path_json = serde_json::to_string(&vec![h.clone(); TX_LEVELS]).unwrap();
+        let json = format!(
+            r#"[{{"amount":"18446744073709551615","privkey_hex":"{h}","blinding_hex":"{h}","leaf_index":"4294967295","path_hex":{path_json}}}]"#
+        );
+        let parsed: Vec<TransactInputNote> = serde_json::from_str(&json).expect("string u64");
+        assert_eq!(parsed[0].amount, u64::MAX);
+        assert_eq!(parsed[0].leaf_index, u32::MAX as u64);
+
+        let bad_leading_zero = format!(
+            r#"[{{"amount":"0100","privkey_hex":"{h}","blinding_hex":"{h}","leaf_index":0,"path_hex":{path_json}}}]"#
+        );
+        assert!(serde_json::from_str::<Vec<TransactInputNote>>(&bad_leading_zero).is_err());
+
+        let bad_plus = format!(
+            r#"[{{"amount":"+100","privkey_hex":"{h}","blinding_hex":"{h}","leaf_index":0,"path_hex":{path_json}}}]"#
+        );
+        assert!(serde_json::from_str::<Vec<TransactInputNote>>(&bad_plus).is_err());
+    }
+
+    #[test]
+    fn v2_and_v3_validators_reject_duplicate_input_commitments_and_bad_structure() {
+        let h1 = "01".repeat(32);
+        let h2 = "02".repeat(32);
+        let path32 = vec![h1.clone(); TX_LEVELS];
+        let idx32 = vec![true; TX_LEVELS];
+
+        let in0 = TransferInputV2 {
+            amount: 500,
+            privkey_hex: h1.clone(),
+            blinding_hex: h1.clone(),
+            path_hex: path32.clone(),
+            indices: idx32.clone(),
+        };
+        let in1 = TransferInputV2 {
+            amount: 500,
+            privkey_hex: h2.clone(),
+            blinding_hex: h2.clone(),
+            path_hex: path32.clone(),
+            indices: idx32.clone(),
+        };
+        let out0 = TransferOutputV2 {
+            amount: 1000,
+            pubkey_hex: h1.clone(),
+            blinding_hex: h1.clone(),
+        };
+        let out1 = TransferOutputV2 {
+            amount: 0,
+            pubkey_hex: h2.clone(),
+            blinding_hex: h2.clone(),
+        };
+
+        assert!(validate_transfer_v2_commitments_and_structure(
+            &[in0, in1],
+            &[out0, out1],
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+        )
+        .is_ok());
+
+        // Duplicate input commitments (same note presented at two different leaf indices)
+        let dup_in0 = TransferInputV2 {
+            amount: 500,
+            privkey_hex: h1.clone(),
+            blinding_hex: h1.clone(),
+            path_hex: path32.clone(),
+            indices: idx32.clone(),
+        };
+        let dup_in1 = TransferInputV2 {
+            amount: 500,
+            privkey_hex: h1.clone(),
+            blinding_hex: h1.clone(),
+            path_hex: path32.clone(),
+            indices: vec![false; TX_LEVELS],
+        };
+        let o0 = TransferOutputV2 {
+            amount: 1000,
+            pubkey_hex: h1.clone(),
+            blinding_hex: h1.clone(),
+        };
+        let o1 = TransferOutputV2 {
+            amount: 0,
+            pubkey_hex: h2.clone(),
+            blinding_hex: h2.clone(),
+        };
+        assert!(validate_transfer_v2_commitments_and_structure(
+            &[dup_in0, dup_in1],
+            &[o0, o1],
+            &[[9u8; 32], [9u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+        )
+        .is_err());
+
+        // V3: dummy input with non-zero leaf_index, zero-sum transfer outputs, and duplicate input commitments
+        let v3_in0 = TransactInputNote {
+            amount: 1000,
+            privkey_hex: h1.clone(),
+            blinding_hex: h1.clone(),
+            leaf_index: 0,
+            path_hex: path32.clone(),
+        };
+        let v3_dummy_bad_idx = TransactInputNote {
+            amount: 0,
+            privkey_hex: h2.clone(),
+            blinding_hex: h2.clone(),
+            leaf_index: 7,
+            path_hex: path32.clone(),
+        };
+        let v3_out0 = TransactOutputNote {
+            amount: 1000,
+            pubkey_hex: h1.clone(),
+            blinding_hex: h1.clone(),
+        };
+        let v3_out1 = TransactOutputNote {
+            amount: 0,
+            pubkey_hex: h2.clone(),
+            blinding_hex: h2.clone(),
+        };
+        assert!(validate_transact_v3_commitments_and_structure(
+            0,
+            &[v3_in0, v3_dummy_bad_idx],
+            &[v3_out0, v3_out1],
+            &[[1u8; 32], [2u8; 32]],
+        )
+        .is_err());
+    }
 }

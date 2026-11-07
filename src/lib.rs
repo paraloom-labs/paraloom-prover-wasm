@@ -112,6 +112,54 @@ fn rng_from_entropy() -> StdRng {
     StdRng::from_seed(seed)
 }
 
+const WITHDRAW_V2_NUM_INSTANCE_VARS: usize = 6; // 1 + [root, nullifier, amount, ext_data_hash, asset_id]
+const TRANSFER_V2_NUM_INSTANCE_VARS: usize = 7; // 1 + [root, nf0, nf1, oc0, oc1, asset_id]
+const TRANSACT_V3_NUM_INSTANCE_VARS: usize = 9; // 1 + [root, public_amount, ext_data_hash, asset_id, nf0, nf1, oc0, oc1]
+
+fn deserialize_and_validate_pk(
+    proving_key: &[u8],
+    expected_num_inputs: usize,
+) -> Result<ProvingKey<Bn254>, String> {
+    let mut cursor = proving_key;
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| format!("bad proving key: {e}"))?;
+    if !cursor.is_empty() {
+        return Err("bad proving key: trailing bytes".to_string());
+    }
+    if pk.vk.gamma_abc_g1.len() != expected_num_inputs {
+        return Err(format!(
+            "bad proving key: expected {expected_num_inputs} public-input IC points, got {}",
+            pk.vk.gamma_abc_g1.len()
+        ));
+    }
+    if !pk.h_query.len().is_power_of_two() {
+        return Err(format!(
+            "bad proving key: h_query length {} is not a power of two (expected CircomReduction convention)",
+            pk.h_query.len()
+        ));
+    }
+    if pk.a_query.len() < expected_num_inputs
+        || pk.b_g1_query.len() < expected_num_inputs
+        || pk.b_g2_query.len() < expected_num_inputs
+        || pk.l_query.is_empty()
+    {
+        return Err("bad proving key: query vectors shorter than circuit instance count".to_string());
+    }
+    Ok(pk)
+}
+
+fn verify_generated_proof(
+    pk: &ProvingKey<Bn254>,
+    public_inputs: &[Fr],
+    proof: &ark_groth16::Proof<Bn254>,
+) -> Result<(), String> {
+    match Groth16ProofSystem::verify(&pk.vk, public_inputs, proof) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("prove failed: generated proof did not pass self-verification".to_string()),
+        Err(e) => Err(format!("prove failed: self-verification error: {e}")),
+    }
+}
+
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
 fn merkle_path_from(
     path_hex: &[String],
@@ -217,11 +265,20 @@ pub fn prove_withdrawal_v2(
         input_path: Some(merkle_path),
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = deserialize_and_validate_pk(proving_key, WITHDRAW_V2_NUM_INSTANCE_VARS)
+        .map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+    let public_inputs = [
+        Fr::from_le_bytes_mod_order(&root),
+        nullifier_fr,
+        Fr::from(amount),
+        Fr::from_le_bytes_mod_order(&ext_data_hash),
+        Fr::from_le_bytes_mod_order(&asset_id),
+    ];
+    verify_generated_proof(&pk, &public_inputs, &proof)
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let mut proof_bytes = Vec::new();
     proof
@@ -358,11 +415,21 @@ pub fn prove_transfer_v2(
         asset_id,
     );
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = deserialize_and_validate_pk(proving_key, TRANSFER_V2_NUM_INSTANCE_VARS)
+        .map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+    let public_inputs = [
+        Fr::from_le_bytes_mod_order(&root),
+        Fr::from_le_bytes_mod_order(&nullifiers[0]),
+        Fr::from_le_bytes_mod_order(&nullifiers[1]),
+        Fr::from_le_bytes_mod_order(&output_commitments[0]),
+        Fr::from_le_bytes_mod_order(&output_commitments[1]),
+        asset_fr,
+    ];
+    verify_generated_proof(&pk, &public_inputs, &proof)
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let mut proof_bytes = Vec::new();
     proof
@@ -602,11 +669,23 @@ pub fn prove_transact(
         out_blindings,
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = deserialize_and_validate_pk(proving_key, TRANSACT_V3_NUM_INSTANCE_VARS)
+        .map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+    let public_inputs = [
+        Fr::from_le_bytes_mod_order(&root),
+        public_amount,
+        Fr::from_le_bytes_mod_order(&ext_data_hash),
+        asset,
+        Fr::from_le_bytes_mod_order(&nullifiers[0]),
+        Fr::from_le_bytes_mod_order(&nullifiers[1]),
+        Fr::from_le_bytes_mod_order(&output_commitments[0]),
+        Fr::from_le_bytes_mod_order(&output_commitments[1]),
+    ];
+    verify_generated_proof(&pk, &public_inputs, &proof)
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let mut proof_bytes = Vec::new();
     proof
@@ -688,4 +767,120 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod proving_key_and_self_verify_tests {
+    use super::*;
+    use ark_groth16::{r1cs_to_qap::LibsnarkReduction, Groth16};
+    use ark_relations::r1cs::{
+        ConstraintSynthesizer, ConstraintSystemRef, LinearCombination, Result as R1csResult,
+    };
+    use ark_snark::CircuitSpecificSetupSNARK;
+
+    struct SmallCircuit {
+        num_public_inputs: usize,
+    }
+
+    impl ConstraintSynthesizer<Fr> for SmallCircuit {
+        fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> R1csResult<()> {
+            let mut inputs = Vec::with_capacity(self.num_public_inputs);
+            for i in 0..self.num_public_inputs {
+                inputs.push(cs.new_input_variable(|| Ok(Fr::from((i + 1) as u64)))?);
+            }
+            let a = cs.new_witness_variable(|| Ok(Fr::from(1u64)))?;
+            let b = cs.new_witness_variable(|| Ok(Fr::from(1u64)))?;
+            cs.enforce_constraint(
+                LinearCombination::from(a),
+                LinearCombination::from(b),
+                LinearCombination::from(inputs[0]),
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn deserialize_and_validate_pk_accepts_matching_circom_key_and_rejects_mismatches() {
+        let mut rng = StdRng::seed_from_u64(0x5150);
+        let (pk_withdraw, _) = Groth16ProofSystem::setup(
+            SmallCircuit {
+                num_public_inputs: WITHDRAW_V2_NUM_INSTANCE_VARS - 1,
+            },
+            &mut rng,
+        )
+        .expect("circom setup");
+
+        let mut pk_bytes = Vec::new();
+        pk_withdraw.serialize_compressed(&mut pk_bytes).unwrap();
+
+        // Matching circuit public-input count and CircomReduction convention succeeds.
+        assert!(deserialize_and_validate_pk(&pk_bytes, WITHDRAW_V2_NUM_INSTANCE_VARS).is_ok());
+
+        // Passing a 5-input (WithdrawCircuitV2) key into TransferCircuitV2 (7) or TransactCircuitV3 (9) fails.
+        let err_transfer =
+            deserialize_and_validate_pk(&pk_bytes, TRANSFER_V2_NUM_INSTANCE_VARS).unwrap_err();
+        assert!(err_transfer.contains("public-input IC points"), "{err_transfer}");
+
+        let err_transact =
+            deserialize_and_validate_pk(&pk_bytes, TRANSACT_V3_NUM_INSTANCE_VARS).unwrap_err();
+        assert!(err_transact.contains("public-input IC points"), "{err_transact}");
+
+        // Trailing bytes are rejected.
+        let mut trailing = pk_bytes.clone();
+        trailing.extend_from_slice(&[0xaa, 0xbb]);
+        let err_trailing =
+            deserialize_and_validate_pk(&trailing, WITHDRAW_V2_NUM_INSTANCE_VARS).unwrap_err();
+        assert!(err_trailing.contains("trailing bytes"), "{err_trailing}");
+
+        // A key generated under LibsnarkReduction (h_query length = 2^k - 1) is rejected.
+        let (pk_libsnark, _) = Groth16::<Bn254, LibsnarkReduction>::setup(
+            SmallCircuit {
+                num_public_inputs: WITHDRAW_V2_NUM_INSTANCE_VARS - 1,
+            },
+            &mut rng,
+        )
+        .expect("libsnark setup");
+        let mut libsnark_bytes = Vec::new();
+        pk_libsnark
+            .serialize_compressed(&mut libsnark_bytes)
+            .unwrap();
+        let err_conv =
+            deserialize_and_validate_pk(&libsnark_bytes, WITHDRAW_V2_NUM_INSTANCE_VARS)
+                .unwrap_err();
+        assert!(err_conv.contains("not a power of two"), "{err_conv}");
+    }
+
+    #[test]
+    fn verify_generated_proof_accepts_valid_and_rejects_mismatched_public_inputs() {
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        let (pk, _) = Groth16ProofSystem::setup(
+            SmallCircuit {
+                num_public_inputs: WITHDRAW_V2_NUM_INSTANCE_VARS - 1,
+            },
+            &mut rng,
+        )
+        .expect("setup");
+        let proof = Groth16ProofSystem::prove(
+            &pk,
+            SmallCircuit {
+                num_public_inputs: WITHDRAW_V2_NUM_INSTANCE_VARS - 1,
+            },
+            &mut rng,
+        )
+        .expect("prove");
+
+        let valid_inputs = [
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+            Fr::from(5u64),
+        ];
+        assert!(verify_generated_proof(&pk, &valid_inputs, &proof).is_ok());
+
+        let mut tampered_inputs = valid_inputs;
+        tampered_inputs[0] = Fr::from(999u64);
+        let err = verify_generated_proof(&pk, &tampered_inputs, &proof).unwrap_err();
+        assert!(err.contains("did not pass self-verification"), "{err}");
+    }
 }

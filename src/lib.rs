@@ -22,8 +22,8 @@ use serde::Deserialize;
 
 use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
 use privacy::poseidon::{
-    poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
-    poseidon_signature,
+    poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier_spend,
+    poseidon_pubkey, poseidon_signature,
 };
 use sha2::{Digest, Sha256};
 
@@ -33,6 +33,114 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut o = [0u8; 32];
     o.copy_from_slice(&v[..32]);
     o
+}
+
+fn v2_empty_tree_root_bytes() -> [u8; 32] {
+    let mut z = Fr::from(0u64);
+    for _ in 0..TX_LEVELS {
+        z = poseidon_merkle_pair(z, z);
+    }
+    fr_to_le_bytes_32(z)
+}
+
+fn v3_zero_hashes_fr() -> Vec<Fr> {
+    let mut zeros = vec![Fr::from(0u64)];
+    for k in 0..TX_LEVELS {
+        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+    }
+    zeros
+}
+
+fn v3_empty_tree_root_bytes() -> [u8; 32] {
+    let zeros = v3_zero_hashes_fr();
+    fr_to_le_bytes_32(zeros[TX_LEVELS])
+}
+
+fn validate_cross_role_commitment_pair(
+    first: &[u8; 32],
+    second: &[u8; 32],
+    context: &str,
+) -> Result<(), String> {
+    if first == second {
+        return Err(format!("{context}: key/recipient and blinding/randomness must be distinct"));
+    }
+    Ok(())
+}
+
+fn validate_v2_withdrawal_cross_role_and_root(
+    root: &[u8; 32],
+    privkey: &[u8; 32],
+    blinding: &[u8; 32],
+    pubkey_bytes: &[u8; 32],
+    dest_recipient: &[u8; 32],
+) -> Result<(), String> {
+    if root == &v2_empty_tree_root_bytes() {
+        return Err("prove_withdrawal_v2: root cannot be the empty-tree root".to_string());
+    }
+    if privkey == blinding {
+        return Err("prove_withdrawal_v2: privkey and blinding must be distinct".to_string());
+    }
+    if dest_recipient == privkey || dest_recipient == blinding || dest_recipient == pubkey_bytes {
+        return Err(
+            "prove_withdrawal_v2: dest_recipient collides with note privkey, pubkey, or blinding"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_transfer_cross_role_and_root(
+    root: &[u8; 32],
+    empty_root: &[u8; 32],
+    in_privkeys: &[[u8; 32]],
+    in_blindings: &[[u8; 32]],
+    out_pubkeys: &[[u8; 32]],
+    out_blindings: &[[u8; 32]],
+    context: &str,
+) -> Result<(), String> {
+    if root == empty_root {
+        return Err(format!("{context}: root cannot be the empty-tree root"));
+    }
+    for i in 0..in_privkeys.len() {
+        if in_privkeys[i] == in_blindings[i] {
+            return Err(format!("{context}: input[{i}] privkey and blinding must be distinct"));
+        }
+    }
+    for j in 0..out_pubkeys.len() {
+        if out_pubkeys[j] == out_blindings[j] {
+            return Err(format!("{context}: output[{j}] pubkey and blinding must be distinct"));
+        }
+        if in_privkeys.contains(&out_pubkeys[j]) || in_blindings.contains(&out_pubkeys[j]) {
+            return Err(format!(
+                "{context}: output[{j}] pubkey collides with an input privkey or blinding"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_transact_recipient_isolation(
+    ext_amount: i64,
+    recipient: &[u8; 32],
+    in_privkeys: &[[u8; 32]],
+    in_pubkeys: &[[u8; 32]],
+    in_blindings: &[[u8; 32]],
+    out_pubkeys: &[[u8; 32]],
+    out_blindings: &[[u8; 32]],
+) -> Result<(), String> {
+    if ext_amount < 0
+        && (in_privkeys.contains(recipient)
+            || in_pubkeys.contains(recipient)
+            || in_blindings.contains(recipient)
+            || out_pubkeys.contains(recipient)
+            || out_blindings.contains(recipient))
+    {
+        return Err(
+            "prove_transact: withdrawal recipient collides with a shielded note key or blinding"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
@@ -55,6 +163,8 @@ pub fn note_commitment(
 ) -> Result<String, JsValue> {
     let randomness = hex32(randomness_hex)?;
     let recipient = hex32(recipient_hex)?;
+    validate_cross_role_commitment_pair(&randomness, &recipient, "note_commitment")
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = poseidon_commit(
         Fr::from(amount),
         Fr::from_le_bytes_mod_order(&randomness),
@@ -96,11 +206,15 @@ pub fn note_commitment_v2(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let privkey = hex32(privkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    validate_cross_role_commitment_pair(&privkey, &blinding, "note_commitment_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
     let c = poseidon_commit_spend(
         Fr::from(amount),
         poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -188,9 +302,19 @@ pub fn prove_withdrawal_v2(
     let leaf_index = leaf_index_from(&indices);
 
     let sk = Fr::from_le_bytes_mod_order(&privkey);
+    let pubkey_fr = poseidon_pubkey(sk);
+    let pubkey_bytes = fr_to_le_bytes_32(pubkey_fr);
+    validate_v2_withdrawal_cross_role_and_root(
+        &root,
+        &privkey,
+        &blinding,
+        &pubkey_bytes,
+        &dest_recipient,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
     let commitment_fr = poseidon_commit_spend(
         Fr::from(amount),
-        poseidon_pubkey(sk),
+        pubkey_fr,
         Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&asset_id),
     );
@@ -343,6 +467,16 @@ pub fn prove_transfer_v2(
         output_blindings.push(blinding);
         output_pubkeys.push(pubkey);
     }
+    validate_transfer_cross_role_and_root(
+        &root,
+        &v2_empty_tree_root_bytes(),
+        &input_privkeys,
+        &input_blindings,
+        &output_pubkeys,
+        &output_blindings,
+        "prove_transfer_v2",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     let circuit = TransferCircuitV2::with_witness(
         root,
@@ -416,10 +550,14 @@ pub fn v3_note_commitment(
     pubkey_hex: &str,
     blinding_hex: &str,
 ) -> Result<String, JsValue> {
+    let pubkey = hex32(pubkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    validate_cross_role_commitment_pair(&pubkey, &blinding, "v3_note_commitment")
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
         Fr::from(0u64), // NATIVE_SOL
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -436,10 +574,14 @@ pub fn v3_note_commitment_asset(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
+    let pubkey = hex32(pubkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    validate_cross_role_commitment_pair(&pubkey, &blinding, "v3_note_commitment_asset")
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -517,6 +659,9 @@ pub fn prove_transact(
     let mut in_blindings = Vec::new();
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
+    let mut raw_in_privkeys = Vec::new();
+    let mut raw_in_pubkeys = Vec::new();
+    let mut raw_in_blindings = Vec::new();
     let mut nullifiers = Vec::new();
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
@@ -533,9 +678,13 @@ pub fn prove_transact(
         }
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let pk_fr = v3_pubkey(sk);
+        raw_in_privkeys.push(privkey);
+        raw_in_pubkeys.push(fr_to_le_bytes_32(pk_fr));
+        raw_in_blindings.push(blinding);
         let c = v3_commit(
             Fr::from(inp.amount),
-            v3_pubkey(sk),
+            pk_fr,
             Fr::from_le_bytes_mod_order(&blinding),
             asset,
         );
@@ -553,10 +702,14 @@ pub fn prove_transact(
     let mut out_amounts = Vec::new();
     let mut out_pubkeys = Vec::new();
     let mut out_blindings = Vec::new();
+    let mut raw_out_pubkeys = Vec::new();
+    let mut raw_out_blindings = Vec::new();
     let mut output_commitments = Vec::new();
     for outp in &outputs {
         let pubkey = hex32(&outp.pubkey_hex)?;
         let blinding = hex32(&outp.blinding_hex)?;
+        raw_out_pubkeys.push(pubkey);
+        raw_out_blindings.push(blinding);
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -568,6 +721,26 @@ pub fn prove_transact(
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
     }
+    validate_transfer_cross_role_and_root(
+        &root,
+        &v3_empty_tree_root_bytes(),
+        &raw_in_privkeys,
+        &raw_in_blindings,
+        &raw_out_pubkeys,
+        &raw_out_blindings,
+        "prove_transact",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    validate_transact_recipient_isolation(
+        ext_amount,
+        &recipient,
+        &raw_in_privkeys,
+        &raw_in_pubkeys,
+        &raw_in_blindings,
+        &raw_out_pubkeys,
+        &raw_out_blindings,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     // public_amount = the field encoding of the signed ext_amount (negative =
     // p − |ext_amount|), exactly as the program derives it on-chain.
@@ -651,15 +824,18 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
     if (leaf_index as usize) >= leaves_hex.len() {
         return Err(JsValue::from_str("leaf_index out of range"));
     }
+    // Zero-subtree hashes, as the on-chain tree pads with.
+    let zeros = v3_zero_hashes_fr();
+
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
-    }
-
-    // Zero-subtree hashes, as the on-chain tree pads with.
-    let mut zeros = vec![Fr::from(0u64)];
-    for k in 0..TX_LEVELS {
-        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+        let lf = Fr::from_le_bytes_mod_order(&hex32(l)?);
+        if zeros.contains(&lf) {
+            return Err(JsValue::from_str(
+                "v3_merkle_path: leaf commitment collides with reserved ZERO_HASHES subtree node",
+            ));
+        }
+        level.push(lf);
     }
 
     let mut path = Vec::with_capacity(TX_LEVELS);
@@ -688,4 +864,67 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod cross_role_key_and_empty_root_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_cross_role_key_blinding_collisions_and_empty_roots() {
+        let sk0 = [11u8; 32];
+        let sk1 = [12u8; 32];
+        let bl0 = [21u8; 32];
+        let bl1 = [22u8; 32];
+        let opk0 = [31u8; 32];
+        let opk1 = [32u8; 32];
+        let obl0 = [41u8; 32];
+        let obl1 = [42u8; 32];
+        let valid_root = [99u8; 32];
+
+        assert!(validate_cross_role_commitment_pair(&sk0, &bl0, "commit").is_ok());
+        assert!(validate_cross_role_commitment_pair(&sk0, &sk0, "commit").is_err());
+
+        // Empty tree roots are rejected
+        assert!(validate_transfer_cross_role_and_root(
+            &v3_empty_tree_root_bytes(),
+            &v3_empty_tree_root_bytes(),
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[opk0, opk1],
+            &[obl0, obl1],
+            "prove_transact",
+        )
+        .is_err());
+
+        // Passing input privkey as output pubkey is rejected (prevents burning output note)
+        assert!(validate_transfer_cross_role_and_root(
+            &valid_root,
+            &v3_empty_tree_root_bytes(),
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[sk0, opk1],
+            &[obl0, obl1],
+            "prove_transact",
+        )
+        .is_err());
+
+        // Withdrawal recipient colliding with shielded keys or blindings is rejected
+        let pk0 = fr_to_le_bytes_32(v3_pubkey(Fr::from_le_bytes_mod_order(&sk0)));
+        assert!(validate_transact_recipient_isolation(
+            -500,
+            &pk0,
+            &[sk0, sk1],
+            &[pk0, [33u8; 32]],
+            &[bl0, bl1],
+            &[opk0, opk1],
+            &[obl0, obl1],
+        )
+        .is_err());
+
+        // Reserved ZERO_HASHES nodes (including Poseidon2(0, 0) = zeros[1]) are present in v3_zero_hashes_fr
+        let zeros = v3_zero_hashes_fr();
+        assert_eq!(zeros.len(), TX_LEVELS + 1);
+        assert_eq!(zeros[1], v3_merkle_pair(Fr::from(0u64), Fr::from(0u64)));
+    }
 }

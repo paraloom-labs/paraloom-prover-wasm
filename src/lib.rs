@@ -11,9 +11,10 @@
 
 pub mod privacy;
 
-use ark_bn254::{Bn254, Fr};
+use ark_bn254::{Bn254, Fr, G1Affine, G2Affine};
+use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
-use ark_groth16::ProvingKey;
+use ark_groth16::{Proof, ProvingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use wasm_bindgen::prelude::*;
@@ -26,6 +27,107 @@ use privacy::poseidon::{
     poseidon_signature,
 };
 use sha2::{Digest, Sha256};
+
+const CEREMONY_V3_VK_ALPHA_G1: [u8; 64] = [
+    45, 77, 154, 167, 227, 2, 217, 223, 65, 116, 157, 85, 7, 148, 157, 5, 219, 234, 51, 251, 177,
+    108, 100, 59, 34, 245, 153, 162, 190, 109, 242, 226, 20, 190, 221, 80, 60, 55, 206, 176, 97,
+    216, 236, 96, 32, 159, 227, 69, 206, 137, 131, 10, 25, 35, 3, 1, 240, 118, 202, 255, 0, 77,
+    25, 38,
+];
+const CEREMONY_V3_VK_DELTA_G2: [u8; 128] = [
+    28, 77, 218, 77, 113, 171, 170, 231, 170, 35, 190, 159, 219, 195, 241, 204, 226, 198, 69, 179,
+    105, 200, 83, 252, 27, 176, 154, 192, 134, 74, 50, 149, 41, 69, 31, 236, 16, 115, 179, 197,
+    253, 104, 49, 85, 253, 230, 228, 66, 212, 250, 254, 93, 155, 75, 28, 193, 14, 79, 11, 134, 122,
+    70, 162, 26, 163, 202, 225, 169, 55, 109, 202, 98, 131, 32, 39, 134, 214, 171, 247, 134, 26,
+    137, 167, 111, 140, 59, 8, 136, 191, 253, 168, 231, 188, 161, 109, 0, 34, 37, 220, 177, 24,
+    118, 227, 155, 12, 77, 38, 121, 1, 216, 82, 146, 217, 205, 153, 213, 50, 81, 174, 18, 16, 133,
+    190, 212, 204, 5, 1, 109,
+];
+
+fn rev32(src: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, b) in src.iter().take(32).rev().enumerate() {
+        out[i] = *b;
+    }
+    out
+}
+
+fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
+    let mut le = Vec::with_capacity(64);
+    p.serialize_uncompressed(&mut le)
+        .expect("G1 serialize_uncompressed");
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&rev32(&le[..32]));
+    out[32..].copy_from_slice(&rev32(&le[32..64]));
+    out
+}
+
+fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
+    let mut le = Vec::with_capacity(128);
+    p.serialize_uncompressed(&mut le)
+        .expect("G2 serialize_uncompressed");
+    let mut out = [0u8; 128];
+    out[..32].copy_from_slice(&rev32(&le[32..64]));
+    out[32..64].copy_from_slice(&rev32(&le[..32]));
+    out[64..96].copy_from_slice(&rev32(&le[96..128]));
+    out[96..].copy_from_slice(&rev32(&le[64..96]));
+    out
+}
+
+pub fn is_ceremony_transact_v3_vk(vk: &ark_groth16::VerifyingKey<Bn254>) -> bool {
+    vk.gamma_abc_g1.len() == 9
+        && g1_to_wire(&vk.alpha_g1) == CEREMONY_V3_VK_ALPHA_G1
+        && g2_to_wire(&vk.delta_g2) == CEREMONY_V3_VK_DELTA_G2
+}
+
+fn validate_pk_and_proof_integrity(
+    pk: &ProvingKey<Bn254>,
+    proof: &Proof<Bn254>,
+    context: &str,
+) -> Result<(), String> {
+    if pk.beta_g1.is_zero()
+        || pk.delta_g1.is_zero()
+        || pk.vk.alpha_g1.is_zero()
+        || pk.vk.beta_g2.is_zero()
+        || pk.vk.gamma_g2.is_zero()
+        || pk.vk.delta_g2.is_zero()
+        || pk.vk.gamma_abc_g1.iter().any(|p| p.is_zero())
+    {
+        return Err(format!("{context}: proving/verifying key contains point at infinity"));
+    }
+    if pk.vk.alpha_g1 == pk.beta_g1
+        || pk.vk.alpha_g1 == pk.delta_g1
+        || pk.beta_g1 == pk.delta_g1
+    {
+        return Err(format!(
+            "{context}: degenerate proving key G1 toxic-waste collision (alpha/beta/delta)"
+        ));
+    }
+    if pk.vk.beta_g2 == pk.vk.gamma_g2
+        || pk.vk.beta_g2 == pk.vk.delta_g2
+        || pk.vk.gamma_g2 == pk.vk.delta_g2
+    {
+        return Err(format!(
+            "{context}: degenerate verifying key G2 toxic-waste collision (beta/gamma/delta)"
+        ));
+    }
+    for i in 0..pk.vk.gamma_abc_g1.len() {
+        for j in (i + 1)..pk.vk.gamma_abc_g1.len() {
+            if pk.vk.gamma_abc_g1[i] == pk.vk.gamma_abc_g1[j] {
+                return Err(format!(
+                    "{context}: duplicate IC point in gamma_abc_g1[{i}] and gamma_abc_g1[{j}]"
+                ));
+            }
+        }
+    }
+    if proof.a.is_zero() || proof.b.is_zero() || proof.c.is_zero() {
+        return Err(format!("{context}: proof contains point at infinity"));
+    }
+    if proof.a == proof.c {
+        return Err(format!("{context}: degenerate proof with proof.a == proof.c"));
+    }
+    Ok(())
+}
 
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut v = fr.into_bigint().to_bytes_le();
@@ -227,6 +329,8 @@ pub fn prove_withdrawal_v2(
     proof
         .serialize_compressed(&mut proof_bytes)
         .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+    validate_pk_and_proof_integrity(&pk, &proof, "prove_withdrawal_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
 
     Ok(format!(
         "{{\"nullifier\":\"{}\",\"proof\":\"{}\"}}",
@@ -368,6 +472,8 @@ pub fn prove_transfer_v2(
     proof
         .serialize_compressed(&mut proof_bytes)
         .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+    validate_pk_and_proof_integrity(&pk, &proof, "prove_transfer_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
@@ -612,6 +718,8 @@ pub fn prove_transact(
     proof
         .serialize_compressed(&mut proof_bytes)
         .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+    validate_pk_and_proof_integrity(&pk, &proof, "prove_transact")
+        .map_err(|e| JsValue::from_str(&e))?;
 
     // The L2 carries `tag(1) || body`. Nodes split the envelope and reject an
     // unknown suite rather than assuming the one they happen to embed, so an
@@ -683,9 +791,118 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
     }
 
     let root = *level.first().unwrap_or(&zeros[TX_LEVELS]);
+    let target_leaf = Fr::from_le_bytes_mod_order(&hex32(&leaves_hex[leaf_index as usize])?);
+    let mut folded = target_leaf;
+    for (depth, sib_hex) in path.iter().enumerate() {
+        let sib = Fr::from_le_bytes_mod_order(&hex32(sib_hex)?);
+        if sib == target_leaf || sib == root {
+            return Err(JsValue::from_str(
+                "merkle path sibling collides with target leaf or root",
+            ));
+        }
+        if ((leaf_index as usize) >> depth) & 1 == 0 {
+            folded = v3_merkle_pair(folded, sib);
+        } else {
+            folded = v3_merkle_pair(sib, folded);
+        }
+    }
+    if folded != root {
+        return Err(JsValue::from_str(
+            "merkle path bit-fold verification failed against computed root",
+        ));
+    }
     Ok(format!(
         "{{\"path\":{},\"root\":\"{}\"}}",
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod issue_55_tests {
+    use super::*;
+    use ark_ec::CurveGroup;
+
+    #[test]
+    fn pk_and_proof_integrity_rejects_toxic_waste_collisions_and_duplicate_ic() {
+        let g1_a = G1Affine::generator();
+        let g1_b = (g1_a + g1_a).into_affine();
+        let g1_c = (g1_b + g1_a).into_affine();
+        let g1_d = (g1_c + g1_a).into_affine();
+        let g2_a = G2Affine::generator();
+        let g2_b = (g2_a + g2_a).into_affine();
+        let g2_c = (g2_b + g2_a).into_affine();
+
+        let vk = ark_groth16::VerifyingKey::<Bn254> {
+            alpha_g1: g1_a,
+            beta_g2: g2_a,
+            gamma_g2: g2_b,
+            delta_g2: g2_c,
+            gamma_abc_g1: vec![g1_a, g1_b, g1_c],
+        };
+        let pk = ProvingKey::<Bn254> {
+            vk,
+            beta_g1: g1_b,
+            delta_g1: g1_c,
+            a_query: vec![g1_a],
+            b_g1_query: vec![g1_a],
+            b_g2_query: vec![g2_a],
+            h_query: vec![g1_a],
+            l_query: vec![g1_a],
+        };
+        let proof = Proof::<Bn254> {
+            a: g1_a,
+            b: g2_a,
+            c: g1_d,
+        };
+        assert!(validate_pk_and_proof_integrity(&pk, &proof, "test").is_ok());
+        assert!(!is_ceremony_transact_v3_vk(&pk.vk));
+
+        // Zero delta_g1 must be rejected.
+        let mut bad_pk = pk.clone();
+        bad_pk.delta_g1 = G1Affine::zero();
+        assert!(validate_pk_and_proof_integrity(&bad_pk, &proof, "test").is_err());
+
+        // Colliding gamma_g2 == delta_g2 must be rejected.
+        let mut bad_vk_pk = pk.clone();
+        bad_vk_pk.vk.gamma_g2 = bad_vk_pk.vk.delta_g2;
+        assert!(validate_pk_and_proof_integrity(&bad_vk_pk, &proof, "test").is_err());
+
+        // Duplicate IC points in gamma_abc_g1 must be rejected.
+        let mut dup_ic_pk = pk.clone();
+        dup_ic_pk.vk.gamma_abc_g1 = vec![g1_a, g1_b, g1_a];
+        assert!(validate_pk_and_proof_integrity(&dup_ic_pk, &proof, "test").is_err());
+
+        // Degenerate proof.a == proof.c must be rejected.
+        let bad_proof = Proof::<Bn254> {
+            a: g1_a,
+            b: g2_a,
+            c: g1_a,
+        };
+        assert!(validate_pk_and_proof_integrity(&pk, &bad_proof, "test").is_err());
+    }
+
+    #[test]
+    fn v3_merkle_path_verifies_bit_fold_consistency() {
+        let leaf0 = v3_commit(
+            Fr::from(500u64),
+            v3_pubkey(Fr::from(11u64)),
+            Fr::from(7u64),
+            Fr::from(0u64),
+        );
+        let leaf1 = v3_commit(
+            Fr::from(900u64),
+            v3_pubkey(Fr::from(22u64)),
+            Fr::from(9u64),
+            Fr::from(0u64),
+        );
+        let leaves_json = serde_json::to_string(&[
+            hex::encode(fr_to_le_bytes_32(leaf0)),
+            hex::encode(fr_to_le_bytes_32(leaf1)),
+        ])
+        .unwrap();
+        let res = v3_merkle_path(&leaves_json, 1).expect("valid path");
+        let parsed: serde_json::Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["path"].as_array().unwrap().len(), TX_LEVELS);
+    }
 }

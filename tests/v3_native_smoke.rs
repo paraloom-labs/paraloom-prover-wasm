@@ -111,6 +111,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     )
@@ -158,6 +159,10 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
     // Verify against the persistent verifying key with the 8 public inputs in
     // circuit order — the same check the on-chain verifier performs.
     let vk = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+    assert!(
+        paraloom_prover_wasm::is_ceremony_transact_v3_vk(&vk),
+        "persistent v3 verifying key must match the pinned ceremony VK"
+    );
     let proof = ark_groth16::Proof::<Bn254>::deserialize_compressed(proof_bytes).unwrap();
 
     let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
@@ -246,6 +251,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );

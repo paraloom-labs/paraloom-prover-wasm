@@ -111,6 +111,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     )
@@ -246,6 +247,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );
@@ -253,5 +255,46 @@ fn v3_merkle_path_output_proves_membership() {
         res.is_ok(),
         "a v3_merkle_path path must prove membership: {:?}",
         res.err()
+    );
+}
+
+#[test]
+fn mint_to_asset_and_v3_merkle_path_reject_zero_noncanonical_and_duplicate_leaves() {
+    use paraloom_prover_wasm::{mint_to_asset, v3_merkle_path};
+
+    let z = hx(&[0u8; 32]);
+    let leaf_a = v3_note_commitment(
+        500,
+        &v3_note_pubkey(&hx(&fr_to_le(&Fr::from(21u64)))).unwrap(),
+        &hx(&fr_to_le(&Fr::from(7u64))),
+    )
+    .unwrap();
+
+    // 1. mint_to_asset must reject the all-zero native SOL placeholder instead of hashing Poseidon2(0, 0)
+    assert!(
+        mint_to_asset(&z).is_err(),
+        "mint_to_asset must reject the all-zero native SOL asset id"
+    );
+
+    // 2. v3_merkle_path must reject all-zero leaf commitments (reserved empty-leaf sentinel zeros[0])
+    let zero_leaves = serde_json::to_string(&[z.clone()]).unwrap();
+    assert!(
+        v3_merkle_path(&zero_leaves, 0).is_err(),
+        "v3_merkle_path must reject all-zero leaf commitment"
+    );
+
+    // 3. v3_merkle_path must reject non-canonical leaf commitments (>= Fr::MODULUS)
+    let non_canonical = "ff".repeat(32);
+    let nc_leaves = serde_json::to_string(&[non_canonical]).unwrap();
+    assert!(
+        v3_merkle_path(&nc_leaves, 0).is_err(),
+        "v3_merkle_path must reject non-canonical leaf commitment"
+    );
+
+    // 4. v3_merkle_path must reject duplicate leaf commitments
+    let dup_leaves = serde_json::to_string(&[leaf_a.clone(), leaf_a]).unwrap();
+    assert!(
+        v3_merkle_path(&dup_leaves, 0).is_err(),
+        "v3_merkle_path must reject duplicate leaf commitments"
     );
 }

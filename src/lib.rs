@@ -35,6 +35,188 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
+const BRIDGE_VAULT_PDA_BYTES: [u8; 32] = [
+    187, 239, 66, 195, 191, 212, 36, 250, 79, 167, 57, 104, 226, 39, 222, 60, 154, 190, 102, 184,
+    247, 79, 10, 56, 154, 69, 136, 219, 232, 155, 167, 186,
+];
+const SLASHED_FUNDS_VAULT_PDA_BYTES: [u8; 32] = [
+    200, 183, 18, 29, 248, 90, 54, 22, 235, 105, 37, 197, 146, 3, 186, 71, 220, 32, 154, 106, 245,
+    28, 66, 227, 54, 104, 2, 68, 94, 75, 178, 44,
+];
+const BRIDGE_STATE_PDA_BYTES: [u8; 32] = [
+    106, 218, 6, 89, 198, 49, 196, 218, 157, 176, 160, 134, 247, 27, 132, 156, 117, 54, 50, 62,
+    139, 246, 196, 143, 42, 124, 44, 154, 210, 83, 9, 121,
+];
+const MERKLE_TREE_PDA_BYTES: [u8; 32] = [
+    32, 4, 144, 180, 75, 152, 95, 161, 59, 73, 212, 248, 161, 197, 18, 88, 89, 102, 6, 82, 184,
+    158, 34, 28, 116, 212, 12, 191, 145, 133, 255, 185,
+];
+const VALIDATOR_REGISTRY_PDA_BYTES: [u8; 32] = [
+    189, 165, 110, 216, 141, 165, 3, 141, 141, 50, 35, 14, 147, 243, 201, 40, 30, 11, 173, 49,
+    139, 135, 63, 124, 55, 27, 22, 232, 156, 232, 154, 16,
+];
+const STAKE_VAULT_AUTHORITY_PDA_BYTES: [u8; 32] = [
+    234, 239, 77, 65, 195, 120, 143, 39, 127, 30, 47, 11, 159, 3, 49, 7, 162, 102, 165, 8, 180,
+    60, 186, 144, 218, 111, 198, 117, 255, 244, 2, 234,
+];
+const ASSET_VAULT_AUTHORITY_PDA_BYTES: [u8; 32] = [
+    49, 128, 138, 182, 14, 179, 209, 42, 7, 98, 123, 16, 57, 54, 76, 5, 88, 188, 112, 58, 210,
+    235, 92, 112, 248, 231, 240, 8, 21, 43, 211, 235,
+];
+const STAKE_TOKEN_VAULT_PDA_BYTES: [u8; 32] = [
+    169, 23, 231, 115, 157, 146, 101, 135, 95, 15, 103, 157, 101, 36, 165, 209, 163, 247, 190, 11,
+    127, 99, 88, 225, 132, 160, 42, 171, 164, 21, 200, 206,
+];
+const PARALOOM_PROGRAM_ID_BYTES: [u8; 32] = [
+    113, 204, 241, 171, 254, 227, 205, 215, 143, 8, 236, 254, 147, 131, 162, 191, 88, 72, 78, 91,
+    168, 25, 5, 102, 241, 226, 154, 249, 82, 134, 235, 145,
+];
+const SPL_TOKEN_PROGRAM_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133,
+    237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+];
+const SPL_TOKEN_2022_PROGRAM_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 238, 117, 143, 222, 24, 66, 93, 188, 228, 108, 205, 218, 182, 26, 252, 77,
+    131, 185, 13, 39, 254, 189, 249, 40, 216, 161, 139, 252,
+];
+const ASSOCIATED_TOKEN_PROGRAM_BYTES: [u8; 32] = [
+    140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131, 11, 90, 19, 153, 218,
+    255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+];
+const BPF_LOADER_UPGRADEABLE_BYTES: [u8; 32] = [
+    2, 168, 246, 145, 78, 136, 161, 176, 226, 16, 21, 62, 247, 99, 174, 43, 0, 194, 185, 61, 22,
+    193, 36, 210, 192, 83, 122, 16, 4, 128, 0, 0,
+];
+const RENT_SYSVAR_BYTES: [u8; 32] = [
+    6, 167, 213, 23, 25, 44, 92, 81, 33, 140, 201, 76, 61, 74, 241, 127, 88, 218, 238, 8, 155,
+    161, 253, 68, 227, 219, 217, 138, 0, 0, 0, 0,
+];
+const CLOCK_SYSVAR_BYTES: [u8; 32] = [
+    6, 167, 213, 23, 24, 199, 116, 201, 40, 86, 99, 152, 105, 29, 94, 182, 139, 94, 184, 163, 155,
+    75, 109, 92, 115, 85, 91, 33, 0, 0, 0, 0,
+];
+const WSOL_NATIVE_MINT_BYTES: [u8; 32] = [
+    6, 155, 136, 87, 254, 171, 129, 132, 251, 104, 127, 99, 70, 24, 192, 53, 218, 196, 57, 220,
+    26, 235, 59, 85, 152, 160, 240, 0, 0, 0, 0, 1,
+];
+
+fn validate_withdrawal_recipient_address(
+    recipient: &[u8; 32],
+    context: &str,
+) -> Result<(), String> {
+    if recipient == &[0u8; 32] {
+        return Err(format!(
+            "{context}: withdrawal recipient cannot be all-zero (System Program)"
+        ));
+    }
+    if recipient == &BRIDGE_VAULT_PDA_BYTES
+        || recipient == &SLASHED_FUNDS_VAULT_PDA_BYTES
+        || recipient == &BRIDGE_STATE_PDA_BYTES
+        || recipient == &MERKLE_TREE_PDA_BYTES
+        || recipient == &VALIDATOR_REGISTRY_PDA_BYTES
+        || recipient == &STAKE_VAULT_AUTHORITY_PDA_BYTES
+        || recipient == &ASSET_VAULT_AUTHORITY_PDA_BYTES
+        || recipient == &STAKE_TOKEN_VAULT_PDA_BYTES
+    {
+        return Err(format!(
+            "{context}: withdrawal recipient cannot be a protocol vault, authority, or state PDA"
+        ));
+    }
+    if recipient == &PARALOOM_PROGRAM_ID_BYTES
+        || recipient == &SPL_TOKEN_PROGRAM_BYTES
+        || recipient == &SPL_TOKEN_2022_PROGRAM_BYTES
+        || recipient == &ASSOCIATED_TOKEN_PROGRAM_BYTES
+        || recipient == &BPF_LOADER_UPGRADEABLE_BYTES
+        || recipient == &RENT_SYSVAR_BYTES
+        || recipient == &CLOCK_SYSVAR_BYTES
+        || recipient == &WSOL_NATIVE_MINT_BYTES
+    {
+        return Err(format!(
+            "{context}: withdrawal recipient cannot be an executable program, sysvar, or mint account"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_merkle_path_sibling_uniqueness_and_isolation(
+    path: &[[u8; 32]],
+    nullifiers: &[[u8; 32]],
+    output_commitments: &[[u8; 32]],
+    asset_id: &[u8; 32],
+    recipient: Option<&[u8; 32]>,
+    context: &str,
+) -> Result<(), String> {
+    for (d1, sib1) in path.iter().enumerate() {
+        for (d2, sib2) in path.iter().enumerate().skip(d1 + 1) {
+            if sib1 == sib2 {
+                return Err(format!(
+                    "{context}: duplicate Merkle path sibling across levels {d1} and {d2}"
+                ));
+            }
+        }
+        if nullifiers.contains(sib1) {
+            return Err(format!(
+                "{context}: Merkle path sibling at depth {d1} collides with transaction nullifier"
+            ));
+        }
+        if output_commitments.contains(sib1) {
+            return Err(format!(
+                "{context}: Merkle path sibling at depth {d1} collides with output commitment"
+            ));
+        }
+        if asset_id != &[0u8; 32] && sib1 == asset_id {
+            return Err(format!(
+                "{context}: Merkle path sibling at depth {d1} collides with non-zero asset_id"
+            ));
+        }
+        if let Some(rec) = recipient {
+            if rec != &[0u8; 32] && sib1 == rec {
+                return Err(format!(
+                    "{context}: Merkle path sibling at depth {d1} collides with withdrawal recipient"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_v3_dummy_and_filler_invariants(
+    inputs: &[TransactInputNote],
+    in_paths: &[Option<Vec<[u8; 32]>>],
+    out_amounts: &[Option<u64>],
+    out_pubkeys: &[Option<[u8; 32]>],
+    ext_amount: i64,
+) -> Result<(), String> {
+    for (idx, inp) in inputs.iter().enumerate() {
+        if inp.amount == 0 {
+            if inp.leaf_index != 0 {
+                return Err(format!(
+                    "prove_transact: zero-value dummy input[{idx}] must have leaf_index == 0, got {}",
+                    inp.leaf_index
+                ));
+            }
+            if let Some(path) = &in_paths[idx] {
+                for (depth, sib) in path.iter().enumerate().skip(1) {
+                    if sib == &[0u8; 32] {
+                        return Err(format!(
+                            "prove_transact: zero-value dummy input[{idx}] has raw all-zero sibling at depth {depth}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if ext_amount < 0 && out_amounts.get(1) == Some(&Some(0)) {
+        if out_pubkeys.first() != out_pubkeys.get(1) {
+            return Err(
+                "prove_transact: withdrawal zero-value filler output (outputs[1]) must share outputs[0] pubkey"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
     let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
     if b.len() != 32 {
@@ -178,6 +360,8 @@ pub fn prove_withdrawal_v2(
     let privkey = hex32(privkey_hex)?;
     let asset_id = hex32(asset_id_hex)?;
     let dest_recipient = hex32(dest_recipient_hex)?;
+    validate_withdrawal_recipient_address(&dest_recipient, "prove_withdrawal_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
         .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
@@ -197,6 +381,16 @@ pub fn prove_withdrawal_v2(
     let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
     let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
     let nullifier = fr_to_le_bytes_32(nullifier_fr);
+    let sibling_hashes: Vec<[u8; 32]> = merkle_path.iter().map(|(s, _)| *s).collect();
+    validate_merkle_path_sibling_uniqueness_and_isolation(
+        &sibling_hashes,
+        &[nullifier],
+        &[],
+        &asset_id,
+        Some(&dest_recipient),
+        "prove_withdrawal_v2",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     // ext_data_hash = sha256(recipient || amount_le), identical to the program's
     // `withdraw_ext_data_hash`.
@@ -342,6 +536,18 @@ pub fn prove_transfer_v2(
         output_values.push(out.amount);
         output_blindings.push(blinding);
         output_pubkeys.push(pubkey);
+    }
+    for (idx, p) in input_paths.iter().enumerate() {
+        let sibs: Vec<[u8; 32]> = p.iter().map(|(s, _)| *s).collect();
+        validate_merkle_path_sibling_uniqueness_and_isolation(
+            &sibs,
+            &nullifiers,
+            &output_commitments,
+            &asset_id,
+            None,
+            &format!("prove_transfer_v2(input[{idx}])"),
+        )
+        .map_err(|e| JsValue::from_str(&e))?;
     }
 
     let circuit = TransferCircuitV2::with_witness(
@@ -499,6 +705,10 @@ pub fn prove_transact(
     }
     let root = hex32(root_hex)?;
     let recipient = hex32(recipient_hex)?;
+    if ext_amount < 0 {
+        validate_withdrawal_recipient_address(&recipient, "prove_transact")
+            .map_err(|e| JsValue::from_str(&e))?;
+    }
 
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
         .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
@@ -510,7 +720,8 @@ pub fn prove_transact(
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let asset_bytes = hex32(asset_id_hex)?;
+    let asset = Fr::from_le_bytes_mod_order(&asset_bytes);
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
@@ -567,6 +778,21 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+    }
+    validate_v3_dummy_and_filler_invariants(&inputs, &in_paths, &out_amounts, &out_pubkeys, ext_amount)
+        .map_err(|e| JsValue::from_str(&e))?;
+    for (idx, p_opt) in in_paths.iter().enumerate() {
+        if let Some(p) = p_opt {
+            validate_merkle_path_sibling_uniqueness_and_isolation(
+                p,
+                &nullifiers,
+                &output_commitments,
+                &asset_bytes,
+                if ext_amount < 0 { Some(&recipient) } else { None },
+                &format!("prove_transact(input[{idx}])"),
+            )
+            .map_err(|e| JsValue::from_str(&e))?;
+        }
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =
@@ -688,4 +914,160 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod issue_51_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_protocol_pda_and_program_withdrawal_recipients() {
+        for forbidden in [
+            [0u8; 32],
+            BRIDGE_VAULT_PDA_BYTES,
+            SLASHED_FUNDS_VAULT_PDA_BYTES,
+            BRIDGE_STATE_PDA_BYTES,
+            MERKLE_TREE_PDA_BYTES,
+            VALIDATOR_REGISTRY_PDA_BYTES,
+            STAKE_VAULT_AUTHORITY_PDA_BYTES,
+            ASSET_VAULT_AUTHORITY_PDA_BYTES,
+            STAKE_TOKEN_VAULT_PDA_BYTES,
+            PARALOOM_PROGRAM_ID_BYTES,
+            SPL_TOKEN_PROGRAM_BYTES,
+            SPL_TOKEN_2022_PROGRAM_BYTES,
+            ASSOCIATED_TOKEN_PROGRAM_BYTES,
+            BPF_LOADER_UPGRADEABLE_BYTES,
+            RENT_SYSVAR_BYTES,
+            CLOCK_SYSVAR_BYTES,
+            WSOL_NATIVE_MINT_BYTES,
+        ] {
+            assert!(
+                validate_withdrawal_recipient_address(&forbidden, "prove_transact").is_err(),
+                "expected forbidden recipient {:?} to be rejected",
+                forbidden
+            );
+        }
+        assert!(validate_withdrawal_recipient_address(&[3u8; 32], "prove_transact").is_ok());
+    }
+
+    #[test]
+    fn rejects_nonzero_leaf_index_and_raw_zero_internal_siblings_on_dummy_inputs() {
+        let mut valid_dummy_path = vec![[0u8; 32]];
+        for depth in 1..TX_LEVELS {
+            valid_dummy_path.push([depth as u8; 32]);
+        }
+        let inputs_bad_idx = vec![
+            TransactInputNote {
+                amount: 1000,
+                privkey_hex: "01".repeat(32),
+                blinding_hex: "02".repeat(32),
+                leaf_index: 5,
+                path_hex: vec![],
+            },
+            TransactInputNote {
+                amount: 0,
+                privkey_hex: "03".repeat(32),
+                blinding_hex: "04".repeat(32),
+                leaf_index: 5,
+                path_hex: vec![],
+            },
+        ];
+        assert!(validate_v3_dummy_and_filler_invariants(
+            &inputs_bad_idx,
+            &[Some(valid_dummy_path.clone()), Some(valid_dummy_path.clone())],
+            &[Some(500), Some(0)],
+            &[Some([9u8; 32]), Some([9u8; 32])],
+            -500,
+        )
+        .is_err());
+
+        let mut bad_zero_sib_path = valid_dummy_path.clone();
+        bad_zero_sib_path[1] = [0u8; 32];
+        let inputs_ok_idx = vec![
+            TransactInputNote {
+                amount: 1000,
+                privkey_hex: "01".repeat(32),
+                blinding_hex: "02".repeat(32),
+                leaf_index: 0,
+                path_hex: vec![],
+            },
+            TransactInputNote {
+                amount: 0,
+                privkey_hex: "03".repeat(32),
+                blinding_hex: "04".repeat(32),
+                leaf_index: 0,
+                path_hex: vec![],
+            },
+        ];
+        assert!(validate_v3_dummy_and_filler_invariants(
+            &inputs_ok_idx,
+            &[Some(valid_dummy_path.clone()), Some(bad_zero_sib_path)],
+            &[Some(500), Some(0)],
+            &[Some([9u8; 32]), Some([9u8; 32])],
+            -500,
+        )
+        .is_err());
+
+        // Mismatched withdrawal filler pubkey is rejected when outputs[1].amount == 0
+        assert!(validate_v3_dummy_and_filler_invariants(
+            &inputs_ok_idx,
+            &[Some(valid_dummy_path.clone()), Some(valid_dummy_path)],
+            &[Some(500), Some(0)],
+            &[Some([9u8; 32]), Some([10u8; 32])],
+            -500,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_level_siblings_and_sibling_object_collisions() {
+        let dup_path = vec![[1u8; 32], [2u8; 32], [1u8; 32]];
+        assert!(validate_merkle_path_sibling_uniqueness_and_isolation(
+            &dup_path,
+            &[[9u8; 32]],
+            &[[8u8; 32]],
+            &[0u8; 32],
+            Some(&[7u8; 32]),
+            "test",
+        )
+        .is_err());
+
+        let distinct_path = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        assert!(validate_merkle_path_sibling_uniqueness_and_isolation(
+            &distinct_path,
+            &[[2u8; 32]],
+            &[[8u8; 32]],
+            &[0u8; 32],
+            Some(&[7u8; 32]),
+            "test",
+        )
+        .is_err());
+        assert!(validate_merkle_path_sibling_uniqueness_and_isolation(
+            &distinct_path,
+            &[[9u8; 32]],
+            &[[3u8; 32]],
+            &[0u8; 32],
+            Some(&[7u8; 32]),
+            "test",
+        )
+        .is_err());
+        assert!(validate_merkle_path_sibling_uniqueness_and_isolation(
+            &distinct_path,
+            &[[9u8; 32]],
+            &[[8u8; 32]],
+            &[1u8; 32],
+            Some(&[7u8; 32]),
+            "test",
+        )
+        .is_err());
+        assert!(validate_merkle_path_sibling_uniqueness_and_isolation(
+            &distinct_path,
+            &[[9u8; 32]],
+            &[[8u8; 32]],
+            &[0u8; 32],
+            Some(&[1u8; 32]),
+            "test",
+        )
+        .is_err());
+    }
 }

@@ -111,6 +111,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     )
@@ -246,6 +247,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );
@@ -253,5 +255,94 @@ fn v3_merkle_path_output_proves_membership() {
         res.is_ok(),
         "a v3_merkle_path path must prove membership: {:?}",
         res.err()
+    );
+}
+
+#[test]
+fn rejects_zero_spend_keys_and_unspendable_zero_pubkey_or_blinding_outputs() {
+    use paraloom_prover_wasm::{spend_pubkey, v3_note_commitment_asset};
+
+    let z = hx(&[0u8; 32]);
+    let nz_scalar = hx(&fr_to_le(&Fr::from(42u64)));
+    let valid_pk = v3_note_pubkey(&nz_scalar).unwrap();
+    let path_json = serde_json::to_string(&vec![z.clone(); 32]).unwrap();
+
+    // 1. All-zero spend private keys must be rejected in both v2 and v3 key derivation
+    assert!(
+        spend_pubkey(&z).is_err(),
+        "v2 spend_pubkey must reject zero privkey"
+    );
+    assert!(
+        v3_note_pubkey(&z).is_err(),
+        "v3_note_pubkey must reject zero privkey"
+    );
+
+    // 2. Non-zero v3 note commitments must reject zero pubkey or zero blinding
+    assert!(
+        v3_note_commitment(100, &z, &nz_scalar).is_err(),
+        "non-zero v3_note_commitment must reject zero pubkey"
+    );
+    assert!(
+        v3_note_commitment(100, &valid_pk, &z).is_err(),
+        "non-zero v3_note_commitment must reject zero blinding"
+    );
+    assert!(
+        v3_note_commitment_asset(100, &z, &nz_scalar, &z).is_err(),
+        "non-zero v3_note_commitment_asset must reject zero pubkey"
+    );
+
+    // 3. prove_transact must reject active input notes with zero privkey or zero blinding
+    let bad_input_privkey = format!(
+        r#"[
+          {{"amount":1000,"privkey_hex":"{z}","blinding_hex":"{nz_scalar}","leaf_index":0,"path_hex":{path_json}}},
+          {{"amount":0,"privkey_hex":"{nz_scalar}","blinding_hex":"{nz_scalar}","leaf_index":0,"path_hex":{path_json}}}
+        ]"#
+    );
+    let valid_outputs = format!(
+        r#"[
+          {{"amount":500,"pubkey_hex":"{valid_pk}","blinding_hex":"{nz_scalar}"}},
+          {{"amount":0,"pubkey_hex":"{valid_pk}","blinding_hex":"{}"}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(99u64)))
+    );
+    assert!(
+        prove_transact(
+            &[],
+            &z,
+            -500,
+            &hx(&[3u8; 32]),
+            &z,
+            &bad_input_privkey,
+            &valid_outputs
+        )
+        .is_err(),
+        "prove_transact must reject active input note with zero privkey"
+    );
+
+    // 4. prove_transact must reject non-zero output notes with zero pubkey or zero blinding
+    let valid_inputs = format!(
+        r#"[
+          {{"amount":1000,"privkey_hex":"{nz_scalar}","blinding_hex":"{nz_scalar}","leaf_index":0,"path_hex":{path_json}}},
+          {{"amount":0,"privkey_hex":"{nz_scalar}","blinding_hex":"{nz_scalar}","leaf_index":0,"path_hex":{path_json}}}
+        ]"#
+    );
+    let zero_pubkey_outputs = format!(
+        r#"[
+          {{"amount":500,"pubkey_hex":"{z}","blinding_hex":"{nz_scalar}"}},
+          {{"amount":0,"pubkey_hex":"{valid_pk}","blinding_hex":"{nz_scalar}"}}
+        ]"#
+    );
+    assert!(
+        prove_transact(
+            &[],
+            &z,
+            -500,
+            &hx(&[3u8; 32]),
+            &z,
+            &valid_inputs,
+            &zero_pubkey_outputs
+        )
+        .is_err(),
+        "prove_transact must reject non-zero output note with zero pubkey"
     );
 }

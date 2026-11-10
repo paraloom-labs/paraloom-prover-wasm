@@ -111,6 +111,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     )
@@ -199,6 +200,21 @@ fn v3_merkle_path_output_proves_membership() {
             return;
         }
     };
+    let vk_bytes = match std::fs::read(format!("{KEYS_DIR}/transact_v3_verifying.key")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("persistent verifying key not present; skipping");
+            return;
+        }
+    };
+
+    if !key_is_circom_convention(&pk_bytes) {
+        eprintln!(
+            "keys/ holds a pre-ceremony arkworks-native key; skipping. \
+             Regenerate from the ceremony zkey to exercise this."
+        );
+        return;
+    }
 
     use paraloom_prover_wasm::privacy::poseidon_circom::{v3_commit, v3_pubkey};
     use paraloom_prover_wasm::v3_merkle_path;
@@ -246,12 +262,55 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );
     assert!(
         res.is_ok(),
         "a v3_merkle_path path must prove membership: {:?}",
-        res.err()
+        res.as_ref().err()
+    );
+
+    let out_str = res.expect("prove_transact");
+    let v_out: serde_json::Value = serde_json::from_str(&out_str).expect("json out");
+    let wire = hex::decode(v_out["proof"].as_str().unwrap()).unwrap();
+    let (suite, proof_bytes) =
+        paraloom_prover_wasm::privacy::proof_codec::split_tagged_proof(&wire)
+            .expect("proof carries a valid suite tag");
+    assert_eq!(
+        suite,
+        paraloom_prover_wasm::privacy::proof_codec::ProofSuite::Groth16Bn254TransactV3
+    );
+
+    let vk = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+    let proof = ark_groth16::Proof::<Bn254>::deserialize_compressed(proof_bytes).unwrap();
+
+    let recipient = [3u8; 32];
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, recipient);
+    sha2::Digest::update(&mut hasher, (-500i64).to_le_bytes());
+    let ext_data_hash: [u8; 32] = sha2::Digest::finalize(hasher).into();
+
+    let root_fr = Fr::from_le_bytes_mod_order(&hex::decode(&root_hex).unwrap());
+    let public_inputs: Vec<Fr> = vec![
+        root_fr,
+        -Fr::from(500u64),
+        Fr::from_le_bytes_mod_order(&ext_data_hash),
+        Fr::from(0u64), // native SOL asset_id
+        Fr::from_le_bytes_mod_order(&hex::decode(v_out["nullifiers"][0].as_str().unwrap()).unwrap()),
+        Fr::from_le_bytes_mod_order(&hex::decode(v_out["nullifiers"][1].as_str().unwrap()).unwrap()),
+        Fr::from_le_bytes_mod_order(&hex::decode(v_out["output_commitments"][0].as_str().unwrap()).unwrap()),
+        Fr::from_le_bytes_mod_order(&hex::decode(v_out["output_commitments"][1].as_str().unwrap()).unwrap()),
+    ];
+
+    assert!(
+        ark_groth16::Groth16::<Bn254>::verify_proof(
+            &ark_groth16::prepare_verifying_key(&vk),
+            &proof,
+            &public_inputs
+        )
+        .expect("verify"),
+        "proof generated from v3_merkle_path must verify against persistent verifying key"
     );
 }

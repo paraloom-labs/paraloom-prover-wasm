@@ -111,6 +111,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     )
@@ -246,6 +247,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        &hx(&[0u8; 32]),
         &inputs,
         &outputs,
     );

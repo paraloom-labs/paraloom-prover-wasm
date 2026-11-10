@@ -12,10 +12,12 @@
 pub mod privacy;
 
 use ark_bn254::{Bn254, Fr};
+use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
-use ark_groth16::ProvingKey;
+use ark_groth16::{Proof, ProvingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
+use ark_std::Zero;
 use wasm_bindgen::prelude::*;
 
 use serde::Deserialize;
@@ -27,6 +29,16 @@ use privacy::poseidon::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(target_arch = "wasm32")]
+pub fn js_err(msg: impl core::fmt::Display) -> JsValue {
+    JsValue::from_str(&msg.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn js_err(_msg: impl core::fmt::Display) -> JsValue {
+    JsValue::NULL
+}
+
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut v = fr.into_bigint().to_bytes_le();
     v.resize(32, 0);
@@ -35,14 +47,68 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
-fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+pub fn is_canonical_le(b: &[u8; 32]) -> bool {
+    let le = Fr::from_le_bytes_mod_order(b).into_bigint().to_bytes_le();
+    let mut canonical = [0u8; 32];
+    let n = le.len().min(32);
+    canonical[..n].copy_from_slice(&le[..n]);
+    &canonical == b
+}
+
+pub fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
+    let clean = s.trim();
+    let clean = clean.strip_prefix("0x").or_else(|| clean.strip_prefix("0X")).unwrap_or(clean);
+    let b = hex::decode(clean).map_err(|e| js_err(format!("bad hex: {e}")))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err(js_err("expected 32-byte hex"));
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+pub fn hex32_scalar(s: &str, field_name: &str) -> Result<Fr, JsValue> {
+    let bytes = hex32(s)?;
+    if !is_canonical_le(&bytes) {
+        return Err(js_err(format!(
+            "{field_name} is not a canonical BN254 scalar (>= modulus)"
+        )));
+    }
+    Ok(Fr::from_le_bytes_mod_order(&bytes))
+}
+
+pub fn hex32_nonzero_scalar(s: &str, field_name: &str) -> Result<Fr, JsValue> {
+    let fr = hex32_scalar(s, field_name)?;
+    if fr.is_zero() {
+        return Err(js_err(format!(
+            "{field_name} must not be zero"
+        )));
+    }
+    Ok(fr)
+}
+
+pub fn validate_pk_and_proof(
+    pk: &ProvingKey<Bn254>,
+    proof: &Proof<Bn254>,
+) -> Result<(), JsValue> {
+    if pk.beta_g1.is_zero()
+        || pk.delta_g1.is_zero()
+        || pk.vk.alpha_g1.is_zero()
+        || pk.vk.beta_g2.is_zero()
+        || pk.vk.gamma_g2.is_zero()
+        || pk.vk.delta_g2.is_zero()
+        || pk.vk.gamma_abc_g1.iter().any(|p| p.is_zero())
+    {
+        return Err(js_err(
+            "proving key contains point at infinity",
+        ));
+    }
+    if proof.a.is_zero() || proof.b.is_zero() || proof.c.is_zero() {
+        return Err(js_err(
+            "proof contains point at infinity",
+        ));
+    }
+    Ok(())
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -53,12 +119,12 @@ pub fn note_commitment(
     randomness_hex: &str,
     recipient_hex: &str,
 ) -> Result<String, JsValue> {
-    let randomness = hex32(randomness_hex)?;
-    let recipient = hex32(recipient_hex)?;
+    let randomness_fr = hex32_nonzero_scalar(randomness_hex, "randomness")?;
+    let recipient_fr = hex32_scalar(recipient_hex, "recipient")?;
     let c = poseidon_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&randomness),
-        Fr::from_le_bytes_mod_order(&recipient),
+        randomness_fr,
+        recipient_fr,
         Fr::from(0u64), // native-SOL asset id (#235)
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -75,7 +141,7 @@ pub fn note_commitment(
 /// [`v3_note_pubkey`], which uses circom Poseidon and is not interchangeable.
 #[wasm_bindgen]
 pub fn spend_pubkey(privkey_hex: &str) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let sk = hex32_nonzero_scalar(privkey_hex, "privkey")?;
     Ok(hex::encode(fr_to_le_bytes_32(poseidon_pubkey(sk))))
 }
 
@@ -96,12 +162,19 @@ pub fn note_commitment_v2(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let sk = hex32_nonzero_scalar(privkey_hex, "privkey")?;
+    let bl = hex32_nonzero_scalar(blinding_hex, "blinding")?;
+    if sk == bl {
+        return Err(js_err(
+            "blinding leak: private key must not equal blinding",
+        ));
+    }
+    let asset = hex32_scalar(asset_id_hex, "asset_id")?;
     let c = poseidon_commit_spend(
         Fr::from(amount),
         poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        bl,
+        asset,
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -118,11 +191,17 @@ fn merkle_path_from(
     indices: &[bool],
 ) -> Result<Vec<([u8; 32], bool)>, JsValue> {
     if path_hex.len() != indices.len() {
-        return Err(JsValue::from_str("path and indices length mismatch"));
+        return Err(js_err("path and indices length mismatch"));
     }
     let mut path = Vec::with_capacity(path_hex.len());
     for (h, dir) in path_hex.iter().zip(indices) {
-        path.push((hex32(h)?, *dir));
+        let b = hex32(h)?;
+        if !is_canonical_le(&b) {
+            return Err(js_err(
+                "Merkle path sibling is not a canonical BN254 scalar",
+            ));
+        }
+        path.push((b, *dir));
     }
     Ok(path)
 }
@@ -173,25 +252,44 @@ pub fn prove_withdrawal_v2(
     path_hex_json: &str,
     indices_json: &str,
 ) -> Result<String, JsValue> {
+    if amount == 0 {
+        return Err(js_err("withdrawal amount must be positive"));
+    }
     let root = hex32(root_hex)?;
+    if root == [0u8; 32] {
+        return Err(js_err("empty Merkle root is invalid"));
+    }
+    if !is_canonical_le(&root) {
+        return Err(js_err("Merkle root is not a canonical BN254 scalar"));
+    }
     let blinding = hex32(blinding_hex)?;
     let privkey = hex32(privkey_hex)?;
     let asset_id = hex32(asset_id_hex)?;
+    if !is_canonical_le(&asset_id) {
+        return Err(js_err("asset_id is not a canonical BN254 scalar"));
+    }
     let dest_recipient = hex32(dest_recipient_hex)?;
 
+    let sk = hex32_nonzero_scalar(privkey_hex, "privkey")?;
+    let bl = hex32_nonzero_scalar(blinding_hex, "blinding")?;
+    if sk == bl {
+        return Err(js_err(
+            "blinding leak: private key must not equal blinding",
+        ));
+    }
+
     let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
-        .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad path json: {e}")))?;
     let indices: Vec<bool> = serde_json::from_str(indices_json)
-        .map_err(|e| JsValue::from_str(&format!("bad indices json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad indices json: {e}")))?;
     let merkle_path = merkle_path_from(&path_hex, &indices)?;
 
     let leaf_index = leaf_index_from(&indices);
 
-    let sk = Fr::from_le_bytes_mod_order(&privkey);
     let commitment_fr = poseidon_commit_spend(
         Fr::from(amount),
         poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&blinding),
+        bl,
         Fr::from_le_bytes_mod_order(&asset_id),
     );
     let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
@@ -218,15 +316,17 @@ pub fn prove_withdrawal_v2(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(&format!("prove failed: {e}")))?;
+
+    validate_pk_and_proof(&pk, &proof)?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(&format!("serialize failed: {e}")))?;
 
     Ok(format!(
         "{{\"nullifier\":\"{}\",\"proof\":\"{}\"}}",
@@ -287,32 +387,87 @@ pub fn prove_transfer_v2(
     outputs_json: &str,
 ) -> Result<String, JsValue> {
     let root = hex32(root_hex)?;
+    if root == [0u8; 32] {
+        return Err(js_err("empty Merkle root is invalid"));
+    }
+    if !is_canonical_le(&root) {
+        return Err(js_err("Merkle root is not a canonical BN254 scalar"));
+    }
     let asset_id = hex32(asset_id_hex)?;
+    if !is_canonical_le(&asset_id) {
+        return Err(js_err("asset_id is not a canonical BN254 scalar"));
+    }
     let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
 
     let inputs: Vec<TransferInputV2> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransferOutputV2> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad outputs json: {e}")))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str(
+        return Err(js_err(
             "transfer requires exactly 2 inputs and 2 outputs",
         ));
     }
+
+    let in_sum = inputs[0]
+        .amount
+        .checked_add(inputs[1].amount)
+        .ok_or_else(|| js_err("input amounts overflow u64"))?;
+    let out_sum = outputs[0]
+        .amount
+        .checked_add(outputs[1].amount)
+        .ok_or_else(|| js_err("output amounts overflow u64"))?;
+    if in_sum != out_sum {
+        return Err(js_err(
+            "value conservation violated: in_sum != out_sum",
+        ));
+    }
+
+    let in0_sk = hex32_nonzero_scalar(&inputs[0].privkey_hex, "input 0 privkey")?;
+    let in1_sk = hex32_nonzero_scalar(&inputs[1].privkey_hex, "input 1 privkey")?;
+    let in0_bl = hex32_nonzero_scalar(&inputs[0].blinding_hex, "input 0 blinding")?;
+    let in1_bl = hex32_nonzero_scalar(&inputs[1].blinding_hex, "input 1 blinding")?;
+
+    let out0_pk = hex32_nonzero_scalar(&outputs[0].pubkey_hex, "output 0 pubkey")?;
+    let out1_pk = hex32_nonzero_scalar(&outputs[1].pubkey_hex, "output 1 pubkey")?;
+    let out0_bl = hex32_nonzero_scalar(&outputs[0].blinding_hex, "output 0 blinding")?;
+    let out1_bl = hex32_nonzero_scalar(&outputs[1].blinding_hex, "output 1 blinding")?;
+
+    if in0_sk == in0_bl || in1_sk == in1_bl {
+        return Err(js_err(
+            "blinding leak: private key must not equal blinding",
+        ));
+    }
+    if in0_bl == in1_bl
+        || out0_bl == out1_bl
+        || in0_bl == out0_bl
+        || in0_bl == out1_bl
+        || in1_bl == out0_bl
+        || in1_bl == out1_bl
+    {
+        return Err(js_err(
+            "duplicate or reused blinding detected; blindings must be pairwise distinct",
+        ));
+    }
+
+    let in_privkeys_fr = [in0_sk, in1_sk];
+    let in_blindings_fr = [in0_bl, in1_bl];
+    let out_pubkeys_fr = [out0_pk, out1_pk];
+    let out_blindings_fr = [out0_bl, out1_bl];
 
     let mut nullifiers = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
     let mut input_paths = Vec::with_capacity(2);
-    for inp in &inputs {
+    for (i, inp) in inputs.iter().enumerate() {
         let blinding = hex32(&inp.blinding_hex)?;
         let privkey = hex32(&inp.privkey_hex)?;
-        let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let sk = in_privkeys_fr[i];
         let commitment_fr = poseidon_commit_spend(
             Fr::from(inp.amount),
             poseidon_pubkey(sk),
-            Fr::from_le_bytes_mod_order(&blinding),
+            in_blindings_fr[i],
             asset_fr,
         );
         let leaf_index = leaf_index_from(&inp.indices);
@@ -329,13 +484,13 @@ pub fn prove_transfer_v2(
     let mut output_values = Vec::with_capacity(2);
     let mut output_blindings = Vec::with_capacity(2);
     let mut output_pubkeys = Vec::with_capacity(2);
-    for out in &outputs {
+    for (i, out) in outputs.iter().enumerate() {
         let blinding = hex32(&out.blinding_hex)?;
         let pubkey = hex32(&out.pubkey_hex)?;
         let commitment_fr = poseidon_commit_spend(
             Fr::from(out.amount),
-            Fr::from_le_bytes_mod_order(&pubkey),
-            Fr::from_le_bytes_mod_order(&blinding),
+            out_pubkeys_fr[i],
+            out_blindings_fr[i],
             asset_fr,
         );
         output_commitments.push(fr_to_le_bytes_32(commitment_fr));
@@ -359,15 +514,17 @@ pub fn prove_transfer_v2(
     );
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(&format!("prove failed: {e}")))?;
+
+    validate_pk_and_proof(&pk, &proof)?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(&format!("serialize failed: {e}")))?;
 
     let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
@@ -396,6 +553,11 @@ use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubke
 #[wasm_bindgen]
 pub fn mint_to_asset(mint_hex: &str) -> Result<String, JsValue> {
     let mint = hex32(mint_hex)?;
+    if mint == [0u8; 32] {
+        return Err(js_err(
+            "native SOL mint (all zeros) has no SPL asset id; use all-zero asset",
+        ));
+    }
     let lo = Fr::from_le_bytes_mod_order(&mint[..16]);
     let hi = Fr::from_le_bytes_mod_order(&mint[16..]);
     Ok(hex::encode(fr_to_le_bytes_32(v3_merkle_pair(lo, hi))))
@@ -404,7 +566,7 @@ pub fn mint_to_asset(mint_hex: &str) -> Result<String, JsValue> {
 /// Derive the v3 spend public key `Poseidon1(privkey)` (circom Poseidon).
 #[wasm_bindgen]
 pub fn v3_note_pubkey(privkey_hex: &str) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let sk = hex32_nonzero_scalar(privkey_hex, "privkey")?;
     Ok(hex::encode(fr_to_le_bytes_32(v3_pubkey(sk))))
 }
 
@@ -416,10 +578,12 @@ pub fn v3_note_commitment(
     pubkey_hex: &str,
     blinding_hex: &str,
 ) -> Result<String, JsValue> {
+    let pk = hex32_nonzero_scalar(pubkey_hex, "pubkey")?;
+    let bl = hex32_nonzero_scalar(blinding_hex, "blinding")?;
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        pk,
+        bl,
         Fr::from(0u64), // NATIVE_SOL
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -436,11 +600,14 @@ pub fn v3_note_commitment_asset(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
+    let pk = hex32_nonzero_scalar(pubkey_hex, "pubkey")?;
+    let bl = hex32_nonzero_scalar(blinding_hex, "blinding")?;
+    let asset = hex32_scalar(asset_id_hex, "asset_id")?;
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        pk,
+        bl,
+        asset,
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -493,24 +660,101 @@ pub fn prove_transact(
     outputs_json: &str,
 ) -> Result<String, JsValue> {
     if ext_amount > 0 {
-        return Err(JsValue::from_str(
+        return Err(js_err(
             "positive ext_amount: deposits go through deposit_note, not transact",
         ));
     }
     let root = hex32(root_hex)?;
+    if root == [0u8; 32] {
+        return Err(js_err("empty Merkle root is invalid"));
+    }
+    if !is_canonical_le(&root) {
+        return Err(js_err("Merkle root is not a canonical BN254 scalar"));
+    }
     let recipient = hex32(recipient_hex)?;
 
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad outputs json: {e}")))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
+        return Err(js_err("transact is fixed 2-in/2-out"));
     }
 
-    // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
-    // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let in_sum = inputs[0]
+        .amount
+        .checked_add(inputs[1].amount)
+        .ok_or_else(|| js_err("input amounts overflow u64"))?;
+    let out_sum = outputs[0]
+        .amount
+        .checked_add(outputs[1].amount)
+        .ok_or_else(|| js_err("output amounts overflow u64"))?;
+
+    let ext_abs = ext_amount.unsigned_abs();
+    if ext_amount < 0 {
+        if in_sum < ext_abs {
+            return Err(js_err(
+                "underflow: input sum is less than external withdrawal amount",
+            ));
+        }
+        if in_sum - ext_abs != out_sum {
+            return Err(js_err(
+                "value conservation violated: in_sum + ext_amount != out_sum",
+            ));
+        }
+    } else {
+        if in_sum != out_sum {
+            return Err(js_err(
+                "value conservation violated: in_sum != out_sum",
+            ));
+        }
+    }
+
+    let in0_sk = hex32_nonzero_scalar(&inputs[0].privkey_hex, "input 0 privkey")?;
+    let in1_sk = hex32_nonzero_scalar(&inputs[1].privkey_hex, "input 1 privkey")?;
+    let in0_bl = hex32_nonzero_scalar(&inputs[0].blinding_hex, "input 0 blinding")?;
+    let in1_bl = hex32_nonzero_scalar(&inputs[1].blinding_hex, "input 1 blinding")?;
+
+    let out0_pk = hex32_nonzero_scalar(&outputs[0].pubkey_hex, "output 0 pubkey")?;
+    let out1_pk = hex32_nonzero_scalar(&outputs[1].pubkey_hex, "output 1 pubkey")?;
+    let out0_bl = hex32_nonzero_scalar(&outputs[0].blinding_hex, "output 0 blinding")?;
+    let out1_bl = hex32_nonzero_scalar(&outputs[1].blinding_hex, "output 1 blinding")?;
+
+    if in0_sk == in0_bl || in1_sk == in1_bl {
+        return Err(js_err(
+            "blinding leak: private key must not equal blinding",
+        ));
+    }
+    if in0_bl == in1_bl
+        || out0_bl == out1_bl
+        || in0_bl == out0_bl
+        || in0_bl == out1_bl
+        || in1_bl == out0_bl
+        || in1_bl == out1_bl
+    {
+        return Err(js_err(
+            "duplicate or reused blinding detected; blindings must be pairwise distinct",
+        ));
+    }
+
+    for (i, inp) in inputs.iter().enumerate() {
+        if inp.leaf_index > u32::MAX as u64 {
+            return Err(js_err(&format!(
+                "input {i} leaf_index exceeds 32-level tree capacity"
+            )));
+        }
+    }
+
+    let asset_bytes = hex32(asset_id_hex)?;
+    if !is_canonical_le(&asset_bytes) {
+        return Err(js_err("asset_id is not a canonical BN254 scalar"));
+    }
+    let asset = Fr::from_le_bytes_mod_order(&asset_bytes);
+
+    let in_privkeys_fr = [in0_sk, in1_sk];
+    let in_blindings_fr = [in0_bl, in1_bl];
+    let out_pubkeys_fr = [out0_pk, out1_pk];
+    let out_blindings_fr = [out0_bl, out1_bl];
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
@@ -518,25 +762,31 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
-    for inp in &inputs {
+    for (i, inp) in inputs.iter().enumerate() {
         let privkey = hex32(&inp.privkey_hex)?;
         let blinding = hex32(&inp.blinding_hex)?;
         if inp.path_hex.len() != TX_LEVELS {
-            return Err(JsValue::from_str(&format!(
+            return Err(js_err(&format!(
                 "input path must have {TX_LEVELS} siblings, got {}",
                 inp.path_hex.len()
             )));
         }
         let mut path = Vec::with_capacity(TX_LEVELS);
         for sib in &inp.path_hex {
-            path.push(hex32(sib)?);
+            let b = hex32(sib)?;
+            if !is_canonical_le(&b) {
+                return Err(js_err(
+                    "input path sibling is not a canonical BN254 scalar",
+                ));
+            }
+            path.push(b);
         }
 
-        let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let sk = in_privkeys_fr[i];
         let c = v3_commit(
             Fr::from(inp.amount),
             v3_pubkey(sk),
-            Fr::from_le_bytes_mod_order(&blinding),
+            in_blindings_fr[i],
             asset,
         );
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
@@ -554,13 +804,13 @@ pub fn prove_transact(
     let mut out_pubkeys = Vec::new();
     let mut out_blindings = Vec::new();
     let mut output_commitments = Vec::new();
-    for outp in &outputs {
+    for (i, outp) in outputs.iter().enumerate() {
         let pubkey = hex32(&outp.pubkey_hex)?;
         let blinding = hex32(&outp.blinding_hex)?;
         let oc = v3_commit(
             Fr::from(outp.amount),
-            Fr::from_le_bytes_mod_order(&pubkey),
-            Fr::from_le_bytes_mod_order(&blinding),
+            out_pubkeys_fr[i],
+            out_blindings_fr[i],
             asset,
         );
         output_commitments.push(fr_to_le_bytes_32(oc));
@@ -603,15 +853,17 @@ pub fn prove_transact(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| js_err(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| js_err(&format!("prove failed: {e}")))?;
+
+    validate_pk_and_proof(&pk, &proof)?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| js_err(&format!("serialize failed: {e}")))?;
 
     // The L2 carries `tag(1) || body`. Nodes split the envelope and reject an
     // unknown suite rather than assuming the one they happen to embed, so an
@@ -647,13 +899,19 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
     use privacy::poseidon_circom::v3_merkle_pair;
 
     let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
-        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
+        .map_err(|e| js_err(&format!("bad leaves json: {e}")))?;
+    if leaves_hex.is_empty() {
+        return Err(js_err("leaves list must not be empty"));
+    }
     if (leaf_index as usize) >= leaves_hex.len() {
-        return Err(JsValue::from_str("leaf_index out of range"));
+        return Err(js_err("leaf_index out of range"));
+    }
+    if leaves_hex.len() > (1usize << TX_LEVELS) {
+        return Err(js_err("leaves count exceeds tree capacity"));
     }
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+        level.push(hex32_scalar(l, "leaf commitment")?);
     }
 
     // Zero-subtree hashes, as the on-chain tree pads with.

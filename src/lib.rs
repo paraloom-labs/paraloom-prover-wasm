@@ -25,6 +25,7 @@ use privacy::poseidon::{
     poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
     poseidon_signature,
 };
+use privacy::poseidon_circom::v3_pubkey;
 use sha2::{Digest, Sha256};
 
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
@@ -33,6 +34,67 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut o = [0u8; 32];
     o.copy_from_slice(&v[..32]);
     o
+}
+
+fn validate_blinding_not_derived_pubkey(
+    privkey: &[u8; 32],
+    blinding: &[u8; 32],
+    context: &str,
+) -> Result<(), String> {
+    let sk = Fr::from_le_bytes_mod_order(privkey);
+    let v2_pk = fr_to_le_bytes_32(poseidon_pubkey(sk));
+    let v3_pk = fr_to_le_bytes_32(v3_pubkey(sk));
+    if blinding == &v2_pk || blinding == &v3_pk {
+        return Err(format!(
+            "{context}: blinding cannot equal the derived v2 or v3 spend public key"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cross_version_pubkeys_and_output_blindings(
+    in_privkeys: &[[u8; 32]],
+    in_blindings: &[[u8; 32]],
+    same_version_in_pubkeys: &[[u8; 32]],
+    wrong_version_in_pubkeys: &[[u8; 32]],
+    out_pubkeys: &[[u8; 32]],
+    out_blindings: &[[u8; 32]],
+    context: &str,
+) -> Result<(), String> {
+    for i in 0..in_privkeys.len() {
+        if in_blindings[i] == same_version_in_pubkeys[i]
+            || in_blindings[i] == wrong_version_in_pubkeys[i]
+        {
+            return Err(format!(
+                "{context}: input[{i}] blinding collides with derived spend public key"
+            ));
+        }
+    }
+    for j in 0..out_pubkeys.len() {
+        if wrong_version_in_pubkeys.contains(&out_pubkeys[j]) {
+            return Err(format!(
+                "{context}: output[{j}] pubkey uses wrong-version Poseidon pubkey derivation for an input spend key"
+            ));
+        }
+        if in_privkeys.contains(&out_blindings[j]) {
+            return Err(format!(
+                "{context}: output[{j}] blinding collides with an input spend private key (would leak spend key in encrypted note)"
+            ));
+        }
+        if in_blindings.contains(&out_blindings[j]) {
+            return Err(format!(
+                "{context}: output[{j}] blinding reuses an input note blinding"
+            ));
+        }
+        if same_version_in_pubkeys.contains(&out_blindings[j])
+            || wrong_version_in_pubkeys.contains(&out_blindings[j])
+        {
+            return Err(format!(
+                "{context}: output[{j}] blinding collides with an input spend public key"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
@@ -96,11 +158,15 @@ pub fn note_commitment_v2(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let privkey = hex32(privkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    validate_blinding_not_derived_pubkey(&privkey, &blinding, "note_commitment_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
     let c = poseidon_commit_spend(
         Fr::from(amount),
         poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -187,6 +253,8 @@ pub fn prove_withdrawal_v2(
 
     let leaf_index = leaf_index_from(&indices);
 
+    validate_blinding_not_derived_pubkey(&privkey, &blinding, "prove_withdrawal_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
     let sk = Fr::from_le_bytes_mod_order(&privkey);
     let commitment_fr = poseidon_commit_spend(
         Fr::from(amount),
@@ -304,14 +372,19 @@ pub fn prove_transfer_v2(
     let mut input_values = Vec::with_capacity(2);
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
+    let mut input_v2_pubkeys = Vec::with_capacity(2);
+    let mut input_v3_pubkeys = Vec::with_capacity(2);
     let mut input_paths = Vec::with_capacity(2);
     for inp in &inputs {
         let blinding = hex32(&inp.blinding_hex)?;
         let privkey = hex32(&inp.privkey_hex)?;
         let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let v2_pk_fr = poseidon_pubkey(sk);
+        input_v2_pubkeys.push(fr_to_le_bytes_32(v2_pk_fr));
+        input_v3_pubkeys.push(fr_to_le_bytes_32(v3_pubkey(sk)));
         let commitment_fr = poseidon_commit_spend(
             Fr::from(inp.amount),
-            poseidon_pubkey(sk),
+            v2_pk_fr,
             Fr::from_le_bytes_mod_order(&blinding),
             asset_fr,
         );
@@ -343,6 +416,16 @@ pub fn prove_transfer_v2(
         output_blindings.push(blinding);
         output_pubkeys.push(pubkey);
     }
+    validate_cross_version_pubkeys_and_output_blindings(
+        &input_privkeys,
+        &input_blindings,
+        &input_v2_pubkeys,
+        &input_v3_pubkeys,
+        &output_pubkeys,
+        &output_blindings,
+        "prove_transfer_v2",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     let circuit = TransferCircuitV2::with_witness(
         root,
@@ -384,7 +467,7 @@ pub fn prove_transfer_v2(
 // ===== circuit v3 (#350): unified transact =====
 
 use privacy::circuits::{TransactCircuitV3, TX_LEVELS};
-use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature};
+use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_signature};
 
 /// Derive the shielded-asset field element for an SPL `mint` (#779):
 /// `Poseidon(2)` over the mint's two 16-byte little-endian halves. Matches the
@@ -518,9 +601,15 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
+    let mut raw_in_privkeys = Vec::new();
+    let mut raw_in_blindings = Vec::new();
+    let mut raw_in_v3_pubkeys = Vec::new();
+    let mut raw_in_v2_pubkeys = Vec::new();
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
         let blinding = hex32(&inp.blinding_hex)?;
+        raw_in_privkeys.push(privkey);
+        raw_in_blindings.push(blinding);
         if inp.path_hex.len() != TX_LEVELS {
             return Err(JsValue::from_str(&format!(
                 "input path must have {TX_LEVELS} siblings, got {}",
@@ -533,9 +622,12 @@ pub fn prove_transact(
         }
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let v3_pk_fr = v3_pubkey(sk);
+        raw_in_v3_pubkeys.push(fr_to_le_bytes_32(v3_pk_fr));
+        raw_in_v2_pubkeys.push(fr_to_le_bytes_32(poseidon_pubkey(sk)));
         let c = v3_commit(
             Fr::from(inp.amount),
-            v3_pubkey(sk),
+            v3_pk_fr,
             Fr::from_le_bytes_mod_order(&blinding),
             asset,
         );
@@ -553,10 +645,14 @@ pub fn prove_transact(
     let mut out_amounts = Vec::new();
     let mut out_pubkeys = Vec::new();
     let mut out_blindings = Vec::new();
+    let mut raw_out_pubkeys = Vec::new();
+    let mut raw_out_blindings = Vec::new();
     let mut output_commitments = Vec::new();
     for outp in &outputs {
         let pubkey = hex32(&outp.pubkey_hex)?;
         let blinding = hex32(&outp.blinding_hex)?;
+        raw_out_pubkeys.push(pubkey);
+        raw_out_blindings.push(blinding);
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -568,6 +664,16 @@ pub fn prove_transact(
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
     }
+    validate_cross_version_pubkeys_and_output_blindings(
+        &raw_in_privkeys,
+        &raw_in_blindings,
+        &raw_in_v3_pubkeys,
+        &raw_in_v2_pubkeys,
+        &raw_out_pubkeys,
+        &raw_out_blindings,
+        "prove_transact",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     // public_amount = the field encoding of the signed ext_amount (negative =
     // p − |ext_amount|), exactly as the program derives it on-chain.
@@ -643,6 +749,7 @@ pub fn prove_transact(
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
@@ -688,4 +795,101 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod cross_version_pubkey_and_output_blinding_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_cross_version_pubkeys_and_output_blinding_secret_leaks() {
+        let sk0 = [11u8; 32];
+        let sk1 = [12u8; 32];
+        let bl0 = [21u8; 32];
+        let bl1 = [22u8; 32];
+        let obl0 = [41u8; 32];
+        let obl1 = [42u8; 32];
+
+        let sk0_fr = Fr::from_le_bytes_mod_order(&sk0);
+        let sk1_fr = Fr::from_le_bytes_mod_order(&sk1);
+        let v2_pk0 = fr_to_le_bytes_32(poseidon_pubkey(sk0_fr));
+        let v2_pk1 = fr_to_le_bytes_32(poseidon_pubkey(sk1_fr));
+        let v3_pk0 = fr_to_le_bytes_32(v3_pubkey(sk0_fr));
+        let v3_pk1 = fr_to_le_bytes_32(v3_pubkey(sk1_fr));
+
+        // Valid v3 self/change outputs using v3_pubkey pass
+        assert!(validate_cross_version_pubkeys_and_output_blindings(
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[v3_pk0, v3_pk1],
+            &[v2_pk0, v2_pk1],
+            &[v3_pk0, [33u8; 32]],
+            &[obl0, obl1],
+            "prove_transact",
+        )
+        .is_ok());
+
+        // Passing v2 spend_pubkey as output pubkey in prove_transact is rejected (prevents burning change note)
+        assert!(validate_cross_version_pubkeys_and_output_blindings(
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[v3_pk0, v3_pk1],
+            &[v2_pk0, v2_pk1],
+            &[v2_pk0, [33u8; 32]],
+            &[obl0, obl1],
+            "prove_transact",
+        )
+        .is_err());
+
+        // Passing v3_note_pubkey as output pubkey in prove_transfer_v2 is rejected
+        assert!(validate_cross_version_pubkeys_and_output_blindings(
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[v2_pk0, v2_pk1],
+            &[v3_pk0, v3_pk1],
+            &[v3_pk0, [33u8; 32]],
+            &[obl0, obl1],
+            "prove_transfer_v2",
+        )
+        .is_err());
+
+        // Output blinding colliding with input spend privkey (would leak spend key in encrypted note) is rejected
+        assert!(validate_cross_version_pubkeys_and_output_blindings(
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[v3_pk0, v3_pk1],
+            &[v2_pk0, v2_pk1],
+            &[v3_pk0, [33u8; 32]],
+            &[sk0, obl1],
+            "prove_transact",
+        )
+        .is_err());
+
+        // Output blinding reusing input blinding or colliding with input pubkey is rejected
+        assert!(validate_cross_version_pubkeys_and_output_blindings(
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[v3_pk0, v3_pk1],
+            &[v2_pk0, v2_pk1],
+            &[v3_pk0, [33u8; 32]],
+            &[bl0, obl1],
+            "prove_transact",
+        )
+        .is_err());
+        assert!(validate_cross_version_pubkeys_and_output_blindings(
+            &[sk0, sk1],
+            &[bl0, bl1],
+            &[v3_pk0, v3_pk1],
+            &[v2_pk0, v2_pk1],
+            &[v3_pk0, [33u8; 32]],
+            &[v3_pk0, obl1],
+            "prove_transact",
+        )
+        .is_err());
+
+        // Blinding equal to derived spend pubkey in note_commitment_v2 / prove_withdrawal_v2 is rejected
+        assert!(validate_blinding_not_derived_pubkey(&sk0, &bl0, "note_commitment_v2").is_ok());
+        assert!(validate_blinding_not_derived_pubkey(&sk0, &v2_pk0, "note_commitment_v2").is_err());
+        assert!(validate_blinding_not_derived_pubkey(&sk0, &v3_pk0, "note_commitment_v2").is_err());
+    }
 }

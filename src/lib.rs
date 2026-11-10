@@ -20,11 +20,12 @@ use wasm_bindgen::prelude::*;
 
 use serde::Deserialize;
 
-use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
+use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2, TX_LEVELS};
 use privacy::poseidon::{
     poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
     poseidon_signature,
 };
+use privacy::poseidon_circom::v3_merkle_pair;
 use sha2::{Digest, Sha256};
 
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
@@ -33,6 +34,112 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut o = [0u8; 32];
     o.copy_from_slice(&v[..32]);
     o
+}
+
+const MIN_WITHDRAWAL_AMOUNT: u64 = 400; // WITHDRAWAL_FEE_BPS = 25 => floor(gross * 25 / 10_000) >= 1
+
+const WSOL_NATIVE_MINT_BYTES: [u8; 32] = [
+    6, 155, 136, 87, 254, 171, 129, 132, 251, 104, 127, 99, 70, 24, 192, 53, 218, 196, 57, 220, 26,
+    235, 59, 85, 152, 160, 240, 0, 0, 0, 0, 1,
+];
+const SPL_TOKEN_PROGRAM_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
+    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+];
+const SPL_TOKEN_2022_PROGRAM_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 238, 117, 143, 222, 24, 66, 93, 188, 228, 108, 205, 218, 182, 26, 252, 77,
+    131, 185, 13, 39, 254, 189, 249, 40, 216, 161, 139, 252,
+];
+const ASSOCIATED_TOKEN_PROGRAM_BYTES: [u8; 32] = [
+    140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131, 11, 90, 19, 153, 218,
+    255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+];
+const PARALOOM_PROGRAM_ID_BYTES: [u8; 32] = [
+    113, 204, 241, 171, 254, 227, 205, 215, 143, 8, 236, 254, 147, 131, 162, 191, 88, 72, 78, 91,
+    168, 25, 5, 102, 241, 226, 154, 249, 82, 134, 235, 145,
+];
+
+fn validate_withdrawal_fee_floor(gross: u64, context: &str) -> Result<(), String> {
+    if gross < MIN_WITHDRAWAL_AMOUNT {
+        return Err(format!(
+            "{context}: withdrawal amount {gross} is below MIN_WITHDRAWAL_AMOUNT ({MIN_WITHDRAWAL_AMOUNT}) and truncates 25 bps validator fee to 0"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_asset_id_bytes(
+    asset_id: &[u8; 32],
+    root: Option<&[u8; 32]>,
+    recipient: Option<&[u8; 32]>,
+    context: &str,
+) -> Result<(), String> {
+    if asset_id == &[0u8; 32] {
+        return Ok(());
+    }
+    if asset_id == &WSOL_NATIVE_MINT_BYTES
+        || asset_id == &SPL_TOKEN_PROGRAM_BYTES
+        || asset_id == &SPL_TOKEN_2022_PROGRAM_BYTES
+        || asset_id == &ASSOCIATED_TOKEN_PROGRAM_BYTES
+        || asset_id == &PARALOOM_PROGRAM_ID_BYTES
+    {
+        return Err(format!(
+            "{context}: asset_id cannot be a raw WSOL mint or Solana program ID"
+        ));
+    }
+    let wsol_lo = Fr::from_le_bytes_mod_order(&WSOL_NATIVE_MINT_BYTES[..16]);
+    let wsol_hi = Fr::from_le_bytes_mod_order(&WSOL_NATIVE_MINT_BYTES[16..]);
+    let wsol_hashed_asset = fr_to_le_bytes_32(v3_merkle_pair(wsol_lo, wsol_hi));
+    if asset_id == &wsol_hashed_asset {
+        return Err(format!(
+            "{context}: WSOL uses all-zero NATIVE_SOL_ASSET, not mint_to_asset(WSOL_MINT)"
+        ));
+    }
+    let mut z = Fr::from(0u64);
+    for depth in 1..=TX_LEVELS {
+        z = v3_merkle_pair(z, z);
+        if asset_id == &fr_to_le_bytes_32(z) {
+            return Err(format!(
+                "{context}: asset_id equals reserved ZERO_HASHES[{depth}] (or mint_to_asset([0; 32]))"
+            ));
+        }
+    }
+    if let Some(r) = root {
+        if asset_id == r {
+            return Err(format!(
+                "{context}: non-zero asset_id collides with Merkle root"
+            ));
+        }
+    }
+    if let Some(rec) = recipient {
+        if asset_id == rec {
+            return Err(format!(
+                "{context}: non-zero asset_id collides with withdrawal recipient"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_commitment_helper_params(
+    secret_or_pub: &[u8; 32],
+    blinding_or_recipient: &[u8; 32],
+    derived_pub: Option<&[u8; 32]>,
+    context: &str,
+) -> Result<(), String> {
+    if secret_or_pub != &[0u8; 32] && secret_or_pub == blinding_or_recipient {
+        return Err(format!(
+            "{context}: secret/public key and blinding/recipient parameters must not be identical"
+        ));
+    }
+    if let Some(pk) = derived_pub {
+        if pk == blinding_or_recipient {
+            return Err(format!(
+                "{context}: derived spend pubkey must not equal blinding"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
@@ -55,6 +162,8 @@ pub fn note_commitment(
 ) -> Result<String, JsValue> {
     let randomness = hex32(randomness_hex)?;
     let recipient = hex32(recipient_hex)?;
+    validate_commitment_helper_params(&randomness, &recipient, None, "note_commitment")
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = poseidon_commit(
         Fr::from(amount),
         Fr::from_le_bytes_mod_order(&randomness),
@@ -96,12 +205,20 @@ pub fn note_commitment_v2(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
+    let privkey = hex32(privkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    let asset_id = hex32(asset_id_hex)?;
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
+    let pubkey = fr_to_le_bytes_32(poseidon_pubkey(sk));
+    validate_commitment_helper_params(&privkey, &blinding, Some(&pubkey), "note_commitment_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
+    validate_asset_id_bytes(&asset_id, None, None, "note_commitment_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = poseidon_commit_spend(
         Fr::from(amount),
         poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        Fr::from_le_bytes_mod_order(&blinding),
+        Fr::from_le_bytes_mod_order(&asset_id),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -178,6 +295,16 @@ pub fn prove_withdrawal_v2(
     let privkey = hex32(privkey_hex)?;
     let asset_id = hex32(asset_id_hex)?;
     let dest_recipient = hex32(dest_recipient_hex)?;
+
+    validate_withdrawal_fee_floor(amount, "prove_withdrawal_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
+    validate_asset_id_bytes(
+        &asset_id,
+        Some(&root),
+        Some(&dest_recipient),
+        "prove_withdrawal_v2",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
         .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
@@ -288,6 +415,8 @@ pub fn prove_transfer_v2(
 ) -> Result<String, JsValue> {
     let root = hex32(root_hex)?;
     let asset_id = hex32(asset_id_hex)?;
+    validate_asset_id_bytes(&asset_id, Some(&root), None, "prove_transfer_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
     let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
 
     let inputs: Vec<TransferInputV2> = serde_json::from_str(inputs_json)
@@ -383,8 +512,8 @@ pub fn prove_transfer_v2(
 
 // ===== circuit v3 (#350): unified transact =====
 
-use privacy::circuits::{TransactCircuitV3, TX_LEVELS};
-use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature};
+use privacy::circuits::TransactCircuitV3;
+use privacy::poseidon_circom::{v3_commit, v3_nullifier, v3_pubkey, v3_signature};
 
 /// Derive the shielded-asset field element for an SPL `mint` (#779):
 /// `Poseidon(2)` over the mint's two 16-byte little-endian halves. Matches the
@@ -416,10 +545,14 @@ pub fn v3_note_commitment(
     pubkey_hex: &str,
     blinding_hex: &str,
 ) -> Result<String, JsValue> {
+    let pubkey = hex32(pubkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    validate_commitment_helper_params(&pubkey, &blinding, None, "v3_note_commitment")
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
         Fr::from(0u64), // NATIVE_SOL
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
@@ -436,11 +569,18 @@ pub fn v3_note_commitment_asset(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
+    let pubkey = hex32(pubkey_hex)?;
+    let blinding = hex32(blinding_hex)?;
+    let asset_id = hex32(asset_id_hex)?;
+    validate_commitment_helper_params(&pubkey, &blinding, None, "v3_note_commitment_asset")
+        .map_err(|e| JsValue::from_str(&e))?;
+    validate_asset_id_bytes(&asset_id, None, None, "v3_note_commitment_asset")
+        .map_err(|e| JsValue::from_str(&e))?;
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
+        Fr::from_le_bytes_mod_order(&asset_id),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -497,6 +637,10 @@ pub fn prove_transact(
             "positive ext_amount: deposits go through deposit_note, not transact",
         ));
     }
+    if ext_amount < 0 {
+        validate_withdrawal_fee_floor(ext_amount.unsigned_abs(), "prove_transact")
+            .map_err(|e| JsValue::from_str(&e))?;
+    }
     let root = hex32(root_hex)?;
     let recipient = hex32(recipient_hex)?;
 
@@ -510,7 +654,15 @@ pub fn prove_transact(
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let asset_bytes = hex32(asset_id_hex)?;
+    validate_asset_id_bytes(
+        &asset_bytes,
+        Some(&root),
+        Some(&recipient),
+        "prove_transact",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    let asset = Fr::from_le_bytes_mod_order(&asset_bytes);
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
@@ -643,6 +795,7 @@ pub fn prove_transact(
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
@@ -688,4 +841,54 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod fee_floor_asset_and_commitment_tests {
+    use super::*;
+
+    #[test]
+    fn validates_withdrawal_fee_floor_asset_id_and_commitment_params() {
+        // Withdrawal fee floor: gross < 400 (0 fee at 25 bps) is rejected, gross >= 400 passes
+        assert!(validate_withdrawal_fee_floor(0, "test").is_err());
+        assert!(validate_withdrawal_fee_floor(399, "test").is_err());
+        assert!(validate_withdrawal_fee_floor(400, "test").is_ok());
+        assert!(validate_withdrawal_fee_floor(500, "test").is_ok());
+
+        // Native SOL [0; 32] and valid SPL asset pass
+        assert!(
+            validate_asset_id_bytes(&[0u8; 32], Some(&[1u8; 32]), Some(&[2u8; 32]), "test").is_ok()
+        );
+        assert!(
+            validate_asset_id_bytes(&[7u8; 32], Some(&[1u8; 32]), Some(&[2u8; 32]), "test").is_ok()
+        );
+
+        // Raw WSOL/program IDs, mint_to_asset(WSOL_MINT), and ZERO_HASHES[1] (mint_to_asset([0; 32])) are rejected
+        assert!(validate_asset_id_bytes(&WSOL_NATIVE_MINT_BYTES, None, None, "test").is_err());
+        assert!(validate_asset_id_bytes(&SPL_TOKEN_PROGRAM_BYTES, None, None, "test").is_err());
+        assert!(validate_asset_id_bytes(&PARALOOM_PROGRAM_ID_BYTES, None, None, "test").is_err());
+
+        let zero_hash_1 = fr_to_le_bytes_32(v3_merkle_pair(Fr::from(0u64), Fr::from(0u64)));
+        assert!(validate_asset_id_bytes(&zero_hash_1, None, None, "test").is_err());
+
+        let wsol_lo = Fr::from_le_bytes_mod_order(&WSOL_NATIVE_MINT_BYTES[..16]);
+        let wsol_hi = Fr::from_le_bytes_mod_order(&WSOL_NATIVE_MINT_BYTES[16..]);
+        let wsol_asset = fr_to_le_bytes_32(v3_merkle_pair(wsol_lo, wsol_hi));
+        assert!(validate_asset_id_bytes(&wsol_asset, None, None, "test").is_err());
+
+        // Non-zero asset_id colliding with root or recipient is rejected
+        assert!(validate_asset_id_bytes(&[9u8; 32], Some(&[9u8; 32]), None, "test").is_err());
+        assert!(validate_asset_id_bytes(&[9u8; 32], None, Some(&[9u8; 32]), "test").is_err());
+
+        // Commitment helper parameter collisions are rejected
+        assert!(validate_commitment_helper_params(&[5u8; 32], &[5u8; 32], None, "test").is_err());
+        let sk_pub = fr_to_le_bytes_32(poseidon_pubkey(Fr::from(11u64)));
+        assert!(
+            validate_commitment_helper_params(&[11u8; 32], &sk_pub, Some(&sk_pub), "test").is_err()
+        );
+        assert!(
+            validate_commitment_helper_params(&[11u8; 32], &[12u8; 32], Some(&sk_pub), "test")
+                .is_ok()
+        );
+    }
 }

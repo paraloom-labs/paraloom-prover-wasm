@@ -112,6 +112,43 @@ fn rng_from_entropy() -> StdRng {
     StdRng::from_seed(seed)
 }
 
+fn validate_and_deserialize_proving_key_inner(
+    proving_key: &[u8],
+    expected_num_inputs: usize,
+) -> Result<ProvingKey<Bn254>, String> {
+    let mut cursor = proving_key;
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| format!("bad proving key: {e}"))?;
+    if !cursor.is_empty() {
+        return Err("trailing bytes in proving key".to_string());
+    }
+    if pk.vk.gamma_abc_g1.len() != expected_num_inputs {
+        return Err(format!(
+            "proving key gamma_abc mismatch: expected {}, got {}",
+            expected_num_inputs,
+            pk.vk.gamma_abc_g1.len()
+        ));
+    }
+    if !pk.h_query.len().is_power_of_two() {
+        return Err("proving key not in circom convention (h_query not power of two)".to_string());
+    }
+    if pk.a_query.len() < expected_num_inputs {
+        return Err("proving key a_query shorter than expected inputs".to_string());
+    }
+    if pk.l_query.is_empty() {
+        return Err("proving key l_query is empty".to_string());
+    }
+    Ok(pk)
+}
+
+fn validate_and_deserialize_proving_key(
+    proving_key: &[u8],
+    expected_num_inputs: usize,
+) -> Result<ProvingKey<Bn254>, JsValue> {
+    validate_and_deserialize_proving_key_inner(proving_key, expected_num_inputs)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
 fn merkle_path_from(
     path_hex: &[String],
@@ -217,11 +254,23 @@ pub fn prove_withdrawal_v2(
         input_path: Some(merkle_path),
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = validate_and_deserialize_proving_key(proving_key, 6)?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+
+    let public_inputs = [
+        Fr::from_le_bytes_mod_order(&root),
+        Fr::from_le_bytes_mod_order(&nullifier),
+        Fr::from(amount),
+        Fr::from_le_bytes_mod_order(&ext_data_hash),
+        Fr::from_le_bytes_mod_order(&asset_id),
+    ];
+    let verified = Groth16ProofSystem::verify(&pk.vk, &public_inputs, &proof)
+        .map_err(|e| JsValue::from_str(&format!("verification failed: {e}")))?;
+    if !verified {
+        return Err(JsValue::from_str("generated proof failed self-verification"));
+    }
 
     let mut proof_bytes = Vec::new();
     proof
@@ -358,11 +407,24 @@ pub fn prove_transfer_v2(
         asset_id,
     );
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = validate_and_deserialize_proving_key(proving_key, 7)?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+
+    let public_inputs = [
+        Fr::from_le_bytes_mod_order(&root),
+        Fr::from_le_bytes_mod_order(&nullifiers[0]),
+        Fr::from_le_bytes_mod_order(&nullifiers[1]),
+        Fr::from_le_bytes_mod_order(&output_commitments[0]),
+        Fr::from_le_bytes_mod_order(&output_commitments[1]),
+        asset_fr,
+    ];
+    let verified = Groth16ProofSystem::verify(&pk.vk, &public_inputs, &proof)
+        .map_err(|e| JsValue::from_str(&format!("verification failed: {e}")))?;
+    if !verified {
+        return Err(JsValue::from_str("generated proof failed self-verification"));
+    }
 
     let mut proof_bytes = Vec::new();
     proof
@@ -602,11 +664,26 @@ pub fn prove_transact(
         out_blindings,
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = validate_and_deserialize_proving_key(proving_key, 9)?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+
+    let public_inputs = [
+        Fr::from_le_bytes_mod_order(&root),
+        public_amount,
+        Fr::from_le_bytes_mod_order(&ext_data_hash),
+        asset,
+        Fr::from_le_bytes_mod_order(&nullifiers[0]),
+        Fr::from_le_bytes_mod_order(&nullifiers[1]),
+        Fr::from_le_bytes_mod_order(&output_commitments[0]),
+        Fr::from_le_bytes_mod_order(&output_commitments[1]),
+    ];
+    let verified = Groth16ProofSystem::verify(&pk.vk, &public_inputs, &proof)
+        .map_err(|e| JsValue::from_str(&format!("verification failed: {e}")))?;
+    if !verified {
+        return Err(JsValue::from_str("generated proof failed self-verification"));
+    }
 
     let mut proof_bytes = Vec::new();
     proof
@@ -688,4 +765,118 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, LinearCombination, SynthesisError};
+    use ark_std::rand::rngs::StdRng;
+    use ark_std::rand::SeedableRng;
+
+    struct DummyTestCircuit {
+        num_inputs: usize,
+    }
+
+    impl ConstraintSynthesizer<Fr> for DummyTestCircuit {
+        fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+            for _ in 0..self.num_inputs {
+                let _ = cs.new_input_variable(|| Ok(Fr::from(1u64)))?;
+            }
+            let a = cs.new_witness_variable(|| Ok(Fr::from(2u64)))?;
+            let b = cs.new_witness_variable(|| Ok(Fr::from(3u64)))?;
+            let c = cs.new_witness_variable(|| Ok(Fr::from(6u64)))?;
+            cs.enforce_constraint(
+                LinearCombination::from(a),
+                LinearCombination::from(b),
+                LinearCombination::from(c),
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_proving_key_validation() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // 8 public inputs + 1 constant = 9 in gamma_abc_g1
+        let (pk, _vk) = Groth16ProofSystem::setup(DummyTestCircuit { num_inputs: 8 }, &mut rng)
+            .expect("setup should succeed");
+
+        let mut pk_bytes = Vec::new();
+        pk.serialize_compressed(&mut pk_bytes).unwrap();
+
+        // Valid key for 9 inputs
+        let valid_res = validate_and_deserialize_proving_key_inner(&pk_bytes, 9);
+        assert!(valid_res.is_ok(), "valid key should pass validation");
+
+        // Trailing bytes
+        let mut trailing_bytes = pk_bytes.clone();
+        trailing_bytes.push(0x42);
+        let err = validate_and_deserialize_proving_key_inner(&trailing_bytes, 9).unwrap_err();
+        assert!(
+            err.contains("trailing bytes"),
+            "expected trailing bytes error, got: {err}"
+        );
+
+        // Expected input count mismatch (e.g. expected 6, got 9)
+        let err = validate_and_deserialize_proving_key_inner(&pk_bytes, 6).unwrap_err();
+        assert!(
+            err.contains("gamma_abc mismatch"),
+            "expected gamma_abc mismatch error, got: {err}"
+        );
+
+        // Non-power-of-two h_query
+        let mut non_power_of_two_pk = pk.clone();
+        non_power_of_two_pk.h_query.pop();
+        let mut np_bytes = Vec::new();
+        non_power_of_two_pk.serialize_compressed(&mut np_bytes).unwrap();
+        let err = validate_and_deserialize_proving_key_inner(&np_bytes, 9).unwrap_err();
+        assert!(
+            err.contains("circom convention"),
+            "expected circom convention error, got: {err}"
+        );
+
+        // a_query shorter than expected inputs
+        let mut short_a_pk = pk.clone();
+        short_a_pk.a_query.truncate(2);
+        let mut sa_bytes = Vec::new();
+        short_a_pk.serialize_compressed(&mut sa_bytes).unwrap();
+        let err = validate_and_deserialize_proving_key_inner(&sa_bytes, 9).unwrap_err();
+        assert!(
+            err.contains("a_query shorter"),
+            "expected a_query shorter error, got: {err}"
+        );
+
+        // Empty l_query
+        let mut empty_l_pk = pk.clone();
+        empty_l_pk.l_query.clear();
+        let mut el_bytes = Vec::new();
+        empty_l_pk.serialize_compressed(&mut el_bytes).unwrap();
+        let err = validate_and_deserialize_proving_key_inner(&el_bytes, 9).unwrap_err();
+        assert!(
+            err.contains("l_query is empty"),
+            "expected l_query is empty error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_groth16_post_prove_self_verification() {
+        let mut rng = StdRng::seed_from_u64(1234);
+        let (pk, vk) = Groth16ProofSystem::setup(DummyTestCircuit { num_inputs: 8 }, &mut rng)
+            .expect("setup should succeed");
+        let proof = Groth16ProofSystem::prove(&pk, DummyTestCircuit { num_inputs: 8 }, &mut rng)
+            .expect("prove should succeed");
+
+        let public_inputs = vec![Fr::from(1u64); 8];
+        let valid = Groth16ProofSystem::verify(&vk, &public_inputs, &proof)
+            .expect("verification should not fail");
+        assert!(valid, "valid proof must verify against pk.vk");
+
+        // Tampered public input
+        let mut tampered_inputs = public_inputs.clone();
+        tampered_inputs[0] = Fr::from(999u64);
+        let invalid = Groth16ProofSystem::verify(&vk, &tampered_inputs, &proof)
+            .expect("verification should not fail");
+        assert!(!invalid, "tampered input must fail self-verification");
+    }
 }

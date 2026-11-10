@@ -33,6 +33,10 @@ pub mod circuits;
 #[path = "../../../paraloom-core/src/privacy/poseidon_circom.rs"]
 pub mod poseidon_circom;
 
+// On-chain ceremony verifying key constants for transact v3 (#350).
+#[path = "../../../paraloom-core/programs/paraloom/src/transact_vk_data.rs"]
+pub mod transact_vk_data;
+
 // `circuits.rs` only needs the asset-id primitives from paraloom-core's `types`
 // module; the full module pulls in note encryption (crypto_box) the prover does
 // not use, so we mirror just these two stable items here. Native-SOL only.

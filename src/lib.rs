@@ -11,9 +11,10 @@
 
 pub mod privacy;
 
-use ark_bn254::{Bn254, Fr};
-use ark_ff::{BigInteger, PrimeField};
-use ark_groth16::ProvingKey;
+use ark_bn254::{Bn254, Fr, G1Affine, G2Affine};
+use ark_ec::AffineRepr;
+use ark_ff::{BigInteger, PrimeField, Zero};
+use ark_groth16::{Proof, ProvingKey, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use wasm_bindgen::prelude::*;
@@ -35,14 +36,211 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
-fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+pub fn hex32_inner(s: &str) -> Result<[u8; 32], String> {
+    let b = hex::decode(s.trim()).map_err(|e| format!("bad hex: {e}"))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err("expected 32-byte hex".to_string());
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
+    hex32_inner(s).map_err(|e| JsValue::from_str(&e))
+}
+
+fn rev32(src: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, b) in src.iter().take(32).rev().enumerate() {
+        out[i] = *b;
+    }
+    out
+}
+
+pub fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
+    let mut le = Vec::with_capacity(64);
+    p.serialize_uncompressed(&mut le).unwrap_or_default();
+    let mut out = [0u8; 64];
+    if le.len() >= 64 {
+        out[..32].copy_from_slice(&rev32(&le[..32]));
+        out[32..].copy_from_slice(&rev32(&le[32..64]));
+    }
+    out
+}
+
+pub fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
+    let mut le = Vec::with_capacity(128);
+    p.serialize_uncompressed(&mut le).unwrap_or_default();
+    let mut out = [0u8; 128];
+    if le.len() >= 128 {
+        out[..32].copy_from_slice(&rev32(&le[32..64]));
+        out[32..64].copy_from_slice(&rev32(&le[..32]));
+        out[64..96].copy_from_slice(&rev32(&le[96..128]));
+        out[96..].copy_from_slice(&rev32(&le[64..96]));
+    }
+    out
+}
+
+pub const TRANSACT_CEREMONY_VK_FINGERPRINT: [u8; 32] = [
+    0x26, 0x3b, 0xc9, 0xa0, 0xc9, 0x45, 0x21, 0xd4, 0x91, 0xc6, 0xb0, 0x71, 0x42, 0x9d, 0xdb,
+    0xd7, 0x7d, 0xd9, 0x13, 0x13, 0xcd, 0x7a, 0xaa, 0xa6, 0x71, 0x65, 0x03, 0x10, 0xd7, 0x24,
+    0x9b, 0x36,
+];
+
+pub fn compute_transact_ceremony_vk_fingerprint() -> [u8; 32] {
+    use privacy::transact_vk_data as vk;
+    let mut hasher = Sha256::new();
+    hasher.update(&vk::VK_ALPHA_G1);
+    hasher.update(&vk::VK_BETA_G2);
+    hasher.update(&vk::VK_GAMMA_G2);
+    hasher.update(&vk::VK_DELTA_G2);
+    hasher.update(&vk::VK_IC_0);
+    hasher.update(&vk::VK_IC_1);
+    hasher.update(&vk::VK_IC_2);
+    hasher.update(&vk::VK_IC_3);
+    hasher.update(&vk::VK_IC_4);
+    hasher.update(&vk::VK_IC_5);
+    hasher.update(&vk::VK_IC_6);
+    hasher.update(&vk::VK_IC_7);
+    hasher.update(&vk::VK_IC_8);
+    hasher.finalize().into()
+}
+
+pub fn compute_vk_fingerprint(vk: &VerifyingKey<Bn254>) -> Result<[u8; 32], String> {
+    if vk.gamma_abc_g1.len() != 9 {
+        return Err(format!(
+            "invalid IC points count for transact v3: expected 9, got {}",
+            vk.gamma_abc_g1.len()
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&g1_to_wire(&vk.alpha_g1));
+    hasher.update(&g2_to_wire(&vk.beta_g2));
+    hasher.update(&g2_to_wire(&vk.gamma_g2));
+    hasher.update(&g2_to_wire(&vk.delta_g2));
+    for ic in &vk.gamma_abc_g1 {
+        hasher.update(&g1_to_wire(ic));
+    }
+    Ok(hasher.finalize().into())
+}
+
+pub fn validate_transact_ceremony_vk(vk: &VerifyingKey<Bn254>) -> Result<(), String> {
+    let fp = compute_vk_fingerprint(vk)?;
+    if fp != TRANSACT_CEREMONY_VK_FINGERPRINT {
+        return Err(
+            "proving key verifying key does not match canonical ceremony verifying key".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_proving_key(pk: &ProvingKey<Bn254>, expected_ic_len: usize) -> Result<(), String> {
+    if pk.beta_g1.is_zero() {
+        return Err("proving key beta_g1 must not be zero".to_string());
+    }
+    if pk.delta_g1.is_zero() {
+        return Err("proving key delta_g1 must not be zero".to_string());
+    }
+    if pk.vk.alpha_g1.is_zero() {
+        return Err("verifying key alpha_g1 must not be zero".to_string());
+    }
+    if pk.vk.beta_g2.is_zero() {
+        return Err("verifying key beta_g2 must not be zero".to_string());
+    }
+    if pk.vk.gamma_g2.is_zero() {
+        return Err("verifying key gamma_g2 must not be zero".to_string());
+    }
+    if pk.vk.delta_g2.is_zero() {
+        return Err("verifying key delta_g2 must not be zero".to_string());
+    }
+
+    if !pk.beta_g1.is_on_curve() || !pk.beta_g1.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("proving key beta_g1 is not on curve or in correct subgroup".to_string());
+    }
+    if !pk.delta_g1.is_on_curve() || !pk.delta_g1.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("proving key delta_g1 is not on curve or in correct subgroup".to_string());
+    }
+    if !pk.vk.alpha_g1.is_on_curve() || !pk.vk.alpha_g1.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("verifying key alpha_g1 is not on curve or in correct subgroup".to_string());
+    }
+    if !pk.vk.beta_g2.is_on_curve() || !pk.vk.beta_g2.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("verifying key beta_g2 is not on curve or in correct subgroup".to_string());
+    }
+    if !pk.vk.gamma_g2.is_on_curve() || !pk.vk.gamma_g2.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("verifying key gamma_g2 is not on curve or in correct subgroup".to_string());
+    }
+    if !pk.vk.delta_g2.is_on_curve() || !pk.vk.delta_g2.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("verifying key delta_g2 is not on curve or in correct subgroup".to_string());
+    }
+
+    if pk.beta_g1 == pk.delta_g1 {
+        return Err("proving key beta_g1 and delta_g1 must not collide".to_string());
+    }
+    if pk.vk.alpha_g1 == pk.beta_g1 {
+        return Err("verifying key alpha_g1 and proving key beta_g1 must not collide".to_string());
+    }
+    if pk.vk.alpha_g1 == pk.delta_g1 {
+        return Err("verifying key alpha_g1 and proving key delta_g1 must not collide".to_string());
+    }
+
+    if pk.vk.gamma_g2 == pk.vk.delta_g2 {
+        return Err("verifying key gamma_g2 and delta_g2 must not collide".to_string());
+    }
+    if pk.vk.beta_g2 == pk.vk.delta_g2 {
+        return Err("verifying key beta_g2 and delta_g2 must not collide".to_string());
+    }
+    if pk.vk.beta_g2 == pk.vk.gamma_g2 {
+        return Err("verifying key beta_g2 and gamma_g2 must not collide".to_string());
+    }
+
+    if pk.vk.gamma_abc_g1.len() != expected_ic_len {
+        return Err(format!(
+            "invalid IC points count: expected {}, got {}",
+            expected_ic_len,
+            pk.vk.gamma_abc_g1.len()
+        ));
+    }
+    for (i, ic) in pk.vk.gamma_abc_g1.iter().enumerate() {
+        if ic.is_zero() {
+            return Err(format!("IC point {i} must not be zero"));
+        }
+        if !ic.is_on_curve() || !ic.is_in_correct_subgroup_assuming_on_curve() {
+            return Err(format!("IC point {i} is not on curve or in correct subgroup"));
+        }
+    }
+    for i in 0..pk.vk.gamma_abc_g1.len() {
+        for j in (i + 1)..pk.vk.gamma_abc_g1.len() {
+            if pk.vk.gamma_abc_g1[i] == pk.vk.gamma_abc_g1[j] {
+                return Err(format!("IC points {i} and {j} must not collide"));
+            }
+        }
+    }
+
+    if !pk.h_query.is_empty() && !pk.h_query.len().is_power_of_two() {
+        return Err("h_query length must be a power of two".to_string());
+    }
+
+    Ok(())
+}
+
+pub fn validate_proof(proof: &Proof<Bn254>) -> Result<(), String> {
+    if proof.a == proof.c {
+        return Err("proof elements A and C must not collide".to_string());
+    }
+    if proof.a.is_zero() || proof.b.is_zero() || proof.c.is_zero() {
+        return Err("proof elements must not be zero".to_string());
+    }
+    if !proof.a.is_on_curve() || !proof.a.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("proof element A is not on curve or in correct subgroup".to_string());
+    }
+    if !proof.b.is_on_curve() || !proof.b.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("proof element B is not on curve or in correct subgroup".to_string());
+    }
+    if !proof.c.is_on_curve() || !proof.c.is_in_correct_subgroup_assuming_on_curve() {
+        return Err("proof element C is not on curve or in correct subgroup".to_string());
+    }
+    Ok(())
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -219,9 +417,13 @@ pub fn prove_withdrawal_v2(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    validate_proving_key(&pk, 6)
+        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+    validate_proof(&proof)
+        .map_err(|e| JsValue::from_str(&format!("invalid proof: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
@@ -360,9 +562,13 @@ pub fn prove_transfer_v2(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    validate_proving_key(&pk, 7)
+        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+    validate_proof(&proof)
+        .map_err(|e| JsValue::from_str(&format!("invalid proof: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
@@ -604,9 +810,15 @@ pub fn prove_transact(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    validate_proving_key(&pk, 9)
+        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    validate_transact_ceremony_vk(&pk.vk)
+        .map_err(|e| JsValue::from_str(&format!("bad ceremony verifying key: {e}")))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+    validate_proof(&proof)
+        .map_err(|e| JsValue::from_str(&format!("invalid proof: {e}")))?;
 
     let mut proof_bytes = Vec::new();
     proof
@@ -631,6 +843,89 @@ pub fn prove_transact(
     ))
 }
 
+pub fn v3_merkle_path_inner(leaves_json: &str, leaf_index: u32) -> Result<String, String> {
+    use privacy::poseidon_circom::v3_merkle_pair;
+
+    let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
+        .map_err(|e| format!("bad leaves json: {e}"))?;
+    if (leaf_index as usize) >= leaves_hex.len() {
+        return Err("leaf_index out of range".to_string());
+    }
+    let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
+    for l in &leaves_hex {
+        level.push(Fr::from_le_bytes_mod_order(&hex32_inner(l)?));
+    }
+
+    let target_leaf = level[leaf_index as usize];
+    if target_leaf.is_zero() {
+        return Err("target leaf must not be zero".to_string());
+    }
+
+    // Zero-subtree hashes, as the on-chain tree pads with.
+    let mut zeros = vec![Fr::from(0u64)];
+    for k in 0..TX_LEVELS {
+        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+    }
+    if zeros.contains(&target_leaf) {
+        return Err("target leaf collides with reserved ZERO_HASHES subtree node".to_string());
+    }
+
+    let mut path = Vec::with_capacity(TX_LEVELS);
+    let mut path_fr = Vec::with_capacity(TX_LEVELS);
+    let mut idx = leaf_index as usize;
+    for depth in 0..TX_LEVELS {
+        let sibling = if idx % 2 == 0 {
+            *level.get(idx + 1).unwrap_or(&zeros[depth])
+        } else {
+            level[idx - 1]
+        };
+        path.push(hex::encode(fr_to_le_bytes_32(sibling)));
+        path_fr.push(sibling);
+
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let l = pair[0];
+            let r = *pair.get(1).unwrap_or(&zeros[depth]);
+            next.push(v3_merkle_pair(l, r));
+        }
+        level = next;
+        idx /= 2;
+    }
+
+    let root = *level.first().unwrap_or(&zeros[TX_LEVELS]);
+
+    if target_leaf == root {
+        return Err("target leaf collides with tree root".to_string());
+    }
+
+    // Bit-fold verification and path-sibling distinctness against target leaf and root
+    let mut cur = target_leaf;
+    for depth in 0..TX_LEVELS {
+        let sibling = path_fr[depth];
+        if sibling == target_leaf {
+            return Err("path sibling collides with target leaf".to_string());
+        }
+        if sibling == root {
+            return Err("path sibling collides with tree root".to_string());
+        }
+        let bit = (leaf_index >> depth) & 1;
+        if bit == 0 {
+            cur = v3_merkle_pair(cur, sibling);
+        } else {
+            cur = v3_merkle_pair(sibling, cur);
+        }
+    }
+    if cur != root {
+        return Err("merkle path fold does not reproduce tree root".to_string());
+    }
+
+    Ok(format!(
+        "{{\"path\":{},\"root\":\"{}\"}}",
+        serde_json::to_string(&path).unwrap(),
+        hex::encode(fr_to_le_bytes_32(root))
+    ))
+}
+
 /// Rebuild the v3 on-chain tree from its ordered leaf list and return the
 /// membership path for `leaf_index` plus the current root.
 ///
@@ -644,48 +939,202 @@ pub fn prove_transact(
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
-    use privacy::poseidon_circom::v3_merkle_pair;
+    v3_merkle_path_inner(leaves_json, leaf_index).map_err(|e| JsValue::from_str(&e))
+}
 
-    let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
-        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
-    if (leaf_index as usize) >= leaves_hex.len() {
-        return Err(JsValue::from_str("leaf_index out of range"));
-    }
-    let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
-    for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_bn254::G1Affine;
+    use privacy::circuits::{Groth16ProofSystem, TransactCircuitV3, WithdrawCircuitV2};
+    use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_pubkey};
 
-    // Zero-subtree hashes, as the on-chain tree pads with.
-    let mut zeros = vec![Fr::from(0u64)];
-    for k in 0..TX_LEVELS {
-        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+    #[test]
+    fn test_ceremony_vk_fingerprint_matches_constant() {
+        let computed = compute_transact_ceremony_vk_fingerprint();
+        assert_eq!(computed, TRANSACT_CEREMONY_VK_FINGERPRINT);
     }
 
-    let mut path = Vec::with_capacity(TX_LEVELS);
-    let mut idx = leaf_index as usize;
-    for depth in 0..TX_LEVELS {
-        let sibling = if idx % 2 == 0 {
-            *level.get(idx + 1).unwrap_or(&zeros[depth])
-        } else {
-            level[idx - 1]
+    #[test]
+    fn test_validate_proving_key_rejects_zero_curve_elements() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let circuit = WithdrawCircuitV2::new();
+        let (clean_pk, _) = Groth16ProofSystem::setup(circuit, &mut rng).expect("setup");
+
+        assert!(validate_proving_key(&clean_pk, 6).is_ok());
+
+        let mut pk = clean_pk.clone();
+        pk.beta_g1 = G1Affine::zero();
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("proving key beta_g1 must not be zero"));
+
+        let mut pk = clean_pk.clone();
+        pk.delta_g1 = G1Affine::zero();
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("proving key delta_g1 must not be zero"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.alpha_g1 = G1Affine::zero();
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key alpha_g1 must not be zero"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.beta_g2 = G2Affine::zero();
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key beta_g2 must not be zero"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.gamma_g2 = G2Affine::zero();
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key gamma_g2 must not be zero"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.delta_g2 = G2Affine::zero();
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key delta_g2 must not be zero"));
+    }
+
+    #[test]
+    fn test_validate_proving_key_rejects_toxic_waste_collisions() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let circuit = WithdrawCircuitV2::new();
+        let (clean_pk, _) = Groth16ProofSystem::setup(circuit, &mut rng).expect("setup");
+
+        let mut pk = clean_pk.clone();
+        pk.beta_g1 = pk.delta_g1;
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("proving key beta_g1 and delta_g1 must not collide"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.alpha_g1 = pk.beta_g1;
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key alpha_g1 and proving key beta_g1 must not collide"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.gamma_g2 = pk.vk.delta_g2;
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key gamma_g2 and delta_g2 must not collide"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.beta_g2 = pk.vk.delta_g2;
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key beta_g2 and delta_g2 must not collide"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.beta_g2 = pk.vk.gamma_g2;
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("verifying key beta_g2 and gamma_g2 must not collide"));
+
+        let mut pk = clean_pk.clone();
+        pk.vk.gamma_abc_g1[1] = pk.vk.gamma_abc_g1[0];
+        let err = validate_proving_key(&pk, 6).unwrap_err();
+        assert!(err.contains("IC points 0 and 1 must not collide"));
+    }
+
+    #[test]
+    fn test_validate_proving_key_rejects_invalid_ic_count() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let circuit = WithdrawCircuitV2::new();
+        let (pk, _) = Groth16ProofSystem::setup(circuit, &mut rng).expect("setup");
+
+        let err = validate_proving_key(&pk, 9).unwrap_err();
+        assert!(err.contains("invalid IC points count: expected 9, got 6"));
+    }
+
+    #[test]
+    fn test_validate_proof_checks() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let (pk, _) = Groth16ProofSystem::setup(WithdrawCircuitV2::new(), &mut rng).expect("setup");
+        let valid_proof = Proof {
+            a: pk.beta_g1,
+            b: pk.vk.beta_g2,
+            c: pk.delta_g1,
         };
-        path.push(hex::encode(fr_to_le_bytes_32(sibling)));
 
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            let l = pair[0];
-            let r = *pair.get(1).unwrap_or(&zeros[depth]);
-            next.push(v3_merkle_pair(l, r));
-        }
-        level = next;
-        idx /= 2;
+        assert!(validate_proof(&valid_proof).is_ok());
+
+        let mut p = valid_proof.clone();
+        p.a = p.c;
+        let err = validate_proof(&p).unwrap_err();
+        assert!(err.contains("proof elements A and C must not collide"));
+
+        let mut p = valid_proof.clone();
+        p.a = G1Affine::zero();
+        let err = validate_proof(&p).unwrap_err();
+        assert!(err.contains("proof elements must not be zero"));
+
+        let mut p = valid_proof.clone();
+        p.b = G2Affine::zero();
+        let err = validate_proof(&p).unwrap_err();
+        assert!(err.contains("proof elements must not be zero"));
+
+        let mut p = valid_proof.clone();
+        p.c = G1Affine::zero();
+        let err = validate_proof(&p).unwrap_err();
+        assert!(err.contains("proof elements must not be zero"));
     }
 
-    let root = *level.first().unwrap_or(&zeros[TX_LEVELS]);
-    Ok(format!(
-        "{{\"path\":{},\"root\":\"{}\"}}",
-        serde_json::to_string(&path).unwrap(),
-        hex::encode(fr_to_le_bytes_32(root))
-    ))
+    #[test]
+    fn test_validate_transact_ceremony_vk_rejects_mismatch() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let (_, vk) = Groth16ProofSystem::setup(TransactCircuitV3::blank(), &mut rng).expect("setup");
+        let err = validate_transact_ceremony_vk(&vk).unwrap_err();
+        assert!(err.contains("proving key verifying key does not match canonical ceremony verifying key"));
+    }
+
+    #[test]
+    fn test_v3_merkle_path_inner_success_and_bit_fold() {
+        let leaf0 = hex::encode(fr_to_le_bytes_32(v3_commit(
+            Fr::from(100u64),
+            v3_pubkey(Fr::from(1u64)),
+            Fr::from(2u64),
+            Fr::from(0u64),
+        )));
+        let leaf1 = hex::encode(fr_to_le_bytes_32(v3_commit(
+            Fr::from(200u64),
+            v3_pubkey(Fr::from(3u64)),
+            Fr::from(4u64),
+            Fr::from(0u64),
+        )));
+        let leaves_json = serde_json::to_string(&vec![leaf0, leaf1]).unwrap();
+
+        let out_json = v3_merkle_path_inner(&leaves_json, 0).expect("v3_merkle_path");
+        let v: serde_json::Value = serde_json::from_str(&out_json).unwrap();
+        let path = v["path"].as_array().unwrap();
+        assert_eq!(path.len(), TX_LEVELS);
+        assert!(v["root"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_v3_merkle_path_inner_rejections() {
+        let leaf0 = hex::encode(fr_to_le_bytes_32(v3_commit(
+            Fr::from(100u64),
+            v3_pubkey(Fr::from(1u64)),
+            Fr::from(2u64),
+            Fr::from(0u64),
+        )));
+        let leaves_json = serde_json::to_string(&vec![leaf0.clone()]).unwrap();
+
+        // Out of range index
+        let err = v3_merkle_path_inner(&leaves_json, 1).unwrap_err();
+        assert!(err.contains("leaf_index out of range"));
+
+        // Zero leaf
+        let zero_leaf = hex::encode([0u8; 32]);
+        let zero_json = serde_json::to_string(&vec![zero_leaf]).unwrap();
+        let err = v3_merkle_path_inner(&zero_json, 0).unwrap_err();
+        assert!(err.contains("target leaf must not be zero"));
+
+        // Subtree zero-node collision
+        let z1 = v3_merkle_pair(Fr::from(0u64), Fr::from(0u64));
+        let z1_hex = hex::encode(fr_to_le_bytes_32(z1));
+        let z1_json = serde_json::to_string(&vec![z1_hex]).unwrap();
+        let err = v3_merkle_path_inner(&z1_json, 0).unwrap_err();
+        assert!(err.contains("target leaf collides with reserved ZERO_HASHES subtree node"));
+
+        // Sibling collides with target leaf
+        let dup_json = serde_json::to_string(&vec![leaf0.clone(), leaf0]).unwrap();
+        let err = v3_merkle_path_inner(&dup_json, 0).unwrap_err();
+        assert!(err.contains("path sibling collides with target leaf"));
+    }
 }

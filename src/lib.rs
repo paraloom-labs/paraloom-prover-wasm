@@ -36,13 +36,36 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+    hex32_inner(s).map_err(|e| JsValue::from_str(&e))
+}
+
+fn hex32_inner(s: &str) -> Result<[u8; 32], String> {
+    let b = hex::decode(s.trim()).map_err(|e| format!("bad hex: {e}"))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err("expected 32-byte hex".into());
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+const ZERO_BYTES: [u8; 32] = [0u8; 32];
+
+/// Reject an all-zero Merkle root; the on-chain `IncrementalMerkleTree::is_known_root`
+/// explicitly returns `false` for `[0u8; 32]`.
+fn reject_zero_root(root: &[u8; 32]) -> Result<(), String> {
+    if *root == ZERO_BYTES {
+        return Err("all-zero Merkle root is rejected on-chain".into());
+    }
+    Ok(())
+}
+
+/// Reject an all-zero 32-byte field element (privkey or blinding).
+fn reject_zero_field(name: &str, val: &[u8; 32]) -> Result<(), String> {
+    if *val == ZERO_BYTES {
+        return Err(format!("{name} must not be all-zero"));
+    }
+    Ok(())
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -113,16 +136,16 @@ fn rng_from_entropy() -> StdRng {
 }
 
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
-fn merkle_path_from(
+fn merkle_path_from_inner(
     path_hex: &[String],
     indices: &[bool],
-) -> Result<Vec<([u8; 32], bool)>, JsValue> {
+) -> Result<Vec<([u8; 32], bool)>, String> {
     if path_hex.len() != indices.len() {
-        return Err(JsValue::from_str("path and indices length mismatch"));
+        return Err("path and indices length mismatch".into());
     }
     let mut path = Vec::with_capacity(path_hex.len());
     for (h, dir) in path_hex.iter().zip(indices) {
-        path.push((hex32(h)?, *dir));
+        path.push((hex32_inner(h)?, *dir));
     }
     Ok(path)
 }
@@ -173,17 +196,46 @@ pub fn prove_withdrawal_v2(
     path_hex_json: &str,
     indices_json: &str,
 ) -> Result<String, JsValue> {
-    let root = hex32(root_hex)?;
-    let blinding = hex32(blinding_hex)?;
-    let privkey = hex32(privkey_hex)?;
-    let asset_id = hex32(asset_id_hex)?;
-    let dest_recipient = hex32(dest_recipient_hex)?;
+    prove_withdrawal_v2_inner(
+        proving_key,
+        root_hex,
+        amount,
+        blinding_hex,
+        privkey_hex,
+        asset_id_hex,
+        dest_recipient_hex,
+        path_hex_json,
+        indices_json,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
 
-    let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
-        .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
-    let indices: Vec<bool> = serde_json::from_str(indices_json)
-        .map_err(|e| JsValue::from_str(&format!("bad indices json: {e}")))?;
-    let merkle_path = merkle_path_from(&path_hex, &indices)?;
+#[allow(clippy::too_many_arguments)]
+fn prove_withdrawal_v2_inner(
+    proving_key: &[u8],
+    root_hex: &str,
+    amount: u64,
+    blinding_hex: &str,
+    privkey_hex: &str,
+    asset_id_hex: &str,
+    dest_recipient_hex: &str,
+    path_hex_json: &str,
+    indices_json: &str,
+) -> Result<String, String> {
+    let root = hex32_inner(root_hex)?;
+    reject_zero_root(&root)?;
+    let blinding = hex32_inner(blinding_hex)?;
+    reject_zero_field("blinding", &blinding)?;
+    let privkey = hex32_inner(privkey_hex)?;
+    reject_zero_field("privkey", &privkey)?;
+    let asset_id = hex32_inner(asset_id_hex)?;
+    let dest_recipient = hex32_inner(dest_recipient_hex)?;
+
+    let path_hex: Vec<String> =
+        serde_json::from_str(path_hex_json).map_err(|e| format!("bad path json: {e}"))?;
+    let indices: Vec<bool> =
+        serde_json::from_str(indices_json).map_err(|e| format!("bad indices json: {e}"))?;
+    let merkle_path = merkle_path_from_inner(&path_hex, &indices)?;
 
     let leaf_index = leaf_index_from(&indices);
 
@@ -218,15 +270,15 @@ pub fn prove_withdrawal_v2(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| format!("bad proving key: {e}"))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| format!("prove failed: {e}"))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| format!("serialize failed: {e}"))?;
 
     Ok(format!(
         "{{\"nullifier\":\"{}\",\"proof\":\"{}\"}}",
@@ -286,28 +338,66 @@ pub fn prove_transfer_v2(
     inputs_json: &str,
     outputs_json: &str,
 ) -> Result<String, JsValue> {
-    let root = hex32(root_hex)?;
-    let asset_id = hex32(asset_id_hex)?;
+    prove_transfer_v2_inner(
+        proving_key,
+        root_hex,
+        asset_id_hex,
+        inputs_json,
+        outputs_json,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+fn prove_transfer_v2_inner(
+    proving_key: &[u8],
+    root_hex: &str,
+    asset_id_hex: &str,
+    inputs_json: &str,
+    outputs_json: &str,
+) -> Result<String, String> {
+    let root = hex32_inner(root_hex)?;
+    reject_zero_root(&root)?;
+    let asset_id = hex32_inner(asset_id_hex)?;
     let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
 
-    let inputs: Vec<TransferInputV2> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
-    let outputs: Vec<TransferOutputV2> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+    let inputs: Vec<TransferInputV2> =
+        serde_json::from_str(inputs_json).map_err(|e| format!("bad inputs json: {e}"))?;
+    let outputs: Vec<TransferOutputV2> =
+        serde_json::from_str(outputs_json).map_err(|e| format!("bad outputs json: {e}"))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str(
-            "transfer requires exactly 2 inputs and 2 outputs",
+        return Err("transfer requires exactly 2 inputs and 2 outputs".into());
+    }
+
+    // ---- u64 overflow guard on sums ----
+    let in_sum = inputs[0]
+        .amount
+        .checked_add(inputs[1].amount)
+        .ok_or("input amounts overflow u64")?;
+    let out_sum = outputs[0]
+        .amount
+        .checked_add(outputs[1].amount)
+        .ok_or("output amounts overflow u64")?;
+    if in_sum != out_sum {
+        return Err(format!(
+            "value not conserved: in_sum={in_sum} != out_sum={out_sum}"
         ));
     }
+
+    // ---- collect all blindings for pairwise-distinct check ----
+    let mut all_blindings: Vec<[u8; 32]> = Vec::with_capacity(4);
 
     let mut nullifiers = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
     let mut input_paths = Vec::with_capacity(2);
-    for inp in &inputs {
-        let blinding = hex32(&inp.blinding_hex)?;
-        let privkey = hex32(&inp.privkey_hex)?;
+    for (i, inp) in inputs.iter().enumerate() {
+        let blinding = hex32_inner(&inp.blinding_hex)?;
+        reject_zero_field(&format!("input[{i}].blinding"), &blinding)?;
+        let privkey = hex32_inner(&inp.privkey_hex)?;
+        reject_zero_field(&format!("input[{i}].privkey"), &privkey)?;
+        all_blindings.push(blinding);
+
         let sk = Fr::from_le_bytes_mod_order(&privkey);
         let commitment_fr = poseidon_commit_spend(
             Fr::from(inp.amount),
@@ -322,16 +412,19 @@ pub fn prove_transfer_v2(
         input_values.push(inp.amount);
         input_blindings.push(blinding);
         input_privkeys.push(privkey);
-        input_paths.push(merkle_path_from(&inp.path_hex, &inp.indices)?);
+        input_paths.push(merkle_path_from_inner(&inp.path_hex, &inp.indices)?);
     }
 
     let mut output_commitments = Vec::with_capacity(2);
     let mut output_values = Vec::with_capacity(2);
     let mut output_blindings = Vec::with_capacity(2);
     let mut output_pubkeys = Vec::with_capacity(2);
-    for out in &outputs {
-        let blinding = hex32(&out.blinding_hex)?;
-        let pubkey = hex32(&out.pubkey_hex)?;
+    for (i, out) in outputs.iter().enumerate() {
+        let blinding = hex32_inner(&out.blinding_hex)?;
+        reject_zero_field(&format!("output[{i}].blinding"), &blinding)?;
+        let pubkey = hex32_inner(&out.pubkey_hex)?;
+        all_blindings.push(blinding);
+
         let commitment_fr = poseidon_commit_spend(
             Fr::from(out.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -342,6 +435,17 @@ pub fn prove_transfer_v2(
         output_values.push(out.amount);
         output_blindings.push(blinding);
         output_pubkeys.push(pubkey);
+    }
+
+    // ---- pairwise-distinct blindings across all inputs + outputs ----
+    for i in 0..all_blindings.len() {
+        for j in (i + 1)..all_blindings.len() {
+            if all_blindings[i] == all_blindings[j] {
+                return Err(format!(
+                    "blindings must be pairwise distinct (slots {i} and {j} collide)"
+                ));
+            }
+        }
     }
 
     let circuit = TransferCircuitV2::with_witness(
@@ -359,15 +463,15 @@ pub fn prove_transfer_v2(
     );
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| format!("bad proving key: {e}"))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| format!("prove failed: {e}"))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| format!("serialize failed: {e}"))?;
 
     let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
@@ -492,25 +596,66 @@ pub fn prove_transact(
     inputs_json: &str,
     outputs_json: &str,
 ) -> Result<String, JsValue> {
-    if ext_amount > 0 {
-        return Err(JsValue::from_str(
-            "positive ext_amount: deposits go through deposit_note, not transact",
-        ));
-    }
-    let root = hex32(root_hex)?;
-    let recipient = hex32(recipient_hex)?;
+    prove_transact_inner(
+        proving_key,
+        root_hex,
+        ext_amount,
+        recipient_hex,
+        asset_id_hex,
+        inputs_json,
+        outputs_json,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
 
-    let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
-    let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+#[allow(clippy::too_many_arguments)]
+fn prove_transact_inner(
+    proving_key: &[u8],
+    root_hex: &str,
+    ext_amount: i64,
+    recipient_hex: &str,
+    asset_id_hex: &str,
+    inputs_json: &str,
+    outputs_json: &str,
+) -> Result<String, String> {
+    if ext_amount > 0 {
+        return Err("positive ext_amount: deposits go through deposit_note, not transact".into());
+    }
+    let root = hex32_inner(root_hex)?;
+    reject_zero_root(&root)?;
+    let recipient = hex32_inner(recipient_hex)?;
+
+    let inputs: Vec<TransactInputNote> =
+        serde_json::from_str(inputs_json).map_err(|e| format!("bad inputs json: {e}"))?;
+    let outputs: Vec<TransactOutputNote> =
+        serde_json::from_str(outputs_json).map_err(|e| format!("bad outputs json: {e}"))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
+        return Err("transact is fixed 2-in/2-out".into());
+    }
+
+    // ---- u64 overflow guard on sums ----
+    let in_sum = inputs[0]
+        .amount
+        .checked_add(inputs[1].amount)
+        .ok_or("input amounts overflow u64")?;
+    let out_sum = outputs[0]
+        .amount
+        .checked_add(outputs[1].amount)
+        .ok_or("output amounts overflow u64")?;
+    // value conservation: in_sum + ext_amount == out_sum  (ext_amount <= 0)
+    let expected_out = (in_sum as i128) + (ext_amount as i128);
+    if expected_out < 0 || expected_out != out_sum as i128 {
+        return Err(format!(
+            "value not conserved: in_sum({in_sum}) + ext_amount({ext_amount}) != out_sum({out_sum})"
+        ));
     }
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let asset = Fr::from_le_bytes_mod_order(&hex32_inner(asset_id_hex)?);
+
+    // ---- collect all blindings for pairwise-distinct check ----
+    let mut all_blindings: Vec<[u8; 32]> = Vec::with_capacity(4);
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
@@ -518,18 +663,22 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
-    for inp in &inputs {
-        let privkey = hex32(&inp.privkey_hex)?;
-        let blinding = hex32(&inp.blinding_hex)?;
+    for (i, inp) in inputs.iter().enumerate() {
+        let privkey = hex32_inner(&inp.privkey_hex)?;
+        reject_zero_field(&format!("input[{i}].privkey"), &privkey)?;
+        let blinding = hex32_inner(&inp.blinding_hex)?;
+        reject_zero_field(&format!("input[{i}].blinding"), &blinding)?;
+        all_blindings.push(blinding);
+
         if inp.path_hex.len() != TX_LEVELS {
-            return Err(JsValue::from_str(&format!(
+            return Err(format!(
                 "input path must have {TX_LEVELS} siblings, got {}",
                 inp.path_hex.len()
-            )));
+            ));
         }
         let mut path = Vec::with_capacity(TX_LEVELS);
         for sib in &inp.path_hex {
-            path.push(hex32(sib)?);
+            path.push(hex32_inner(sib)?);
         }
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
@@ -554,9 +703,12 @@ pub fn prove_transact(
     let mut out_pubkeys = Vec::new();
     let mut out_blindings = Vec::new();
     let mut output_commitments = Vec::new();
-    for outp in &outputs {
-        let pubkey = hex32(&outp.pubkey_hex)?;
-        let blinding = hex32(&outp.blinding_hex)?;
+    for (i, outp) in outputs.iter().enumerate() {
+        let pubkey = hex32_inner(&outp.pubkey_hex)?;
+        let blinding = hex32_inner(&outp.blinding_hex)?;
+        reject_zero_field(&format!("output[{i}].blinding"), &blinding)?;
+        all_blindings.push(blinding);
+
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -567,6 +719,17 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+    }
+
+    // ---- pairwise-distinct blindings across all inputs + outputs ----
+    for i in 0..all_blindings.len() {
+        for j in (i + 1)..all_blindings.len() {
+            if all_blindings[i] == all_blindings[j] {
+                return Err(format!(
+                    "blindings must be pairwise distinct (slots {i} and {j} collide)"
+                ));
+            }
+        }
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =
@@ -603,15 +766,15 @@ pub fn prove_transact(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| format!("bad proving key: {e}"))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| format!("prove failed: {e}"))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| format!("serialize failed: {e}"))?;
 
     // The L2 carries `tag(1) || body`. Nodes split the envelope and reject an
     // unknown suite rather than assuming the one they happen to embed, so an
@@ -643,6 +806,7 @@ pub fn prove_transact(
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
@@ -688,4 +852,600 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hx(b: &[u8; 32]) -> String {
+        hex::encode(b)
+    }
+
+    const ZERO_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn nonzero_hex(seed: u8) -> String {
+        let mut v = [0u8; 32];
+        v[0] = seed;
+        hx(&v)
+    }
+
+    // ---------- reject_zero_root ------------------------------------------------
+
+    #[test]
+    fn reject_zero_root_rejects_all_zero() {
+        assert!(reject_zero_root(&[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn reject_zero_root_accepts_nonzero() {
+        let mut r = [0u8; 32];
+        r[0] = 1;
+        assert!(reject_zero_root(&r).is_ok());
+    }
+
+    // ---------- reject_zero_field -----------------------------------------------
+
+    #[test]
+    fn reject_zero_field_rejects_all_zero() {
+        assert!(reject_zero_field("test", &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn reject_zero_field_accepts_nonzero() {
+        let mut v = [0u8; 32];
+        v[31] = 0xff;
+        assert!(reject_zero_field("test", &v).is_ok());
+    }
+
+    // ---------- prove_withdrawal_v2_inner: zero root ----------------------------
+
+    #[test]
+    fn withdrawal_v2_rejects_zero_root() {
+        let err = prove_withdrawal_v2_inner(
+            &[],
+            ZERO_HEX,
+            100,
+            &nonzero_hex(1),
+            &nonzero_hex(2),
+            ZERO_HEX,
+            &nonzero_hex(3),
+            "[]",
+            "[]",
+        )
+        .unwrap_err();
+        assert!(err.contains("all-zero Merkle root"), "{err}");
+    }
+
+    // ---------- prove_withdrawal_v2_inner: zero blinding ------------------------
+
+    #[test]
+    fn withdrawal_v2_rejects_zero_blinding() {
+        let err = prove_withdrawal_v2_inner(
+            &[],
+            &nonzero_hex(99),
+            100,
+            ZERO_HEX, // blinding
+            &nonzero_hex(2),
+            ZERO_HEX,
+            &nonzero_hex(3),
+            "[]",
+            "[]",
+        )
+        .unwrap_err();
+        assert!(err.contains("blinding must not be all-zero"), "{err}");
+    }
+
+    // ---------- prove_withdrawal_v2_inner: zero privkey -------------------------
+
+    #[test]
+    fn withdrawal_v2_rejects_zero_privkey() {
+        let err = prove_withdrawal_v2_inner(
+            &[],
+            &nonzero_hex(99),
+            100,
+            &nonzero_hex(1),
+            ZERO_HEX, // privkey
+            ZERO_HEX,
+            &nonzero_hex(3),
+            "[]",
+            "[]",
+        )
+        .unwrap_err();
+        assert!(err.contains("privkey must not be all-zero"), "{err}");
+    }
+
+    // ---------- prove_transfer_v2_inner: zero root ------------------------------
+
+    #[test]
+    fn transfer_v2_rejects_zero_root() {
+        let err = prove_transfer_v2_inner(&[], ZERO_HEX, ZERO_HEX, "[]", "[]").unwrap_err();
+        assert!(err.contains("all-zero Merkle root"), "{err}");
+    }
+
+    // ---------- prove_transfer_v2_inner: u64 overflow ---------------------------
+
+    #[test]
+    fn transfer_v2_rejects_input_overflow() {
+        // We only need the amounts to collide; the function checks overflow
+        // before touching the proving key, so empty-key errors do not matter.
+        let inputs = format!(
+            r#"[
+              {{"amount":{max},"privkey_hex":"{p0}","blinding_hex":"{b0}","path_hex":[],"indices":[]}},
+              {{"amount":1,"privkey_hex":"{p1}","blinding_hex":"{b1}","path_hex":[],"indices":[]}}
+            ]"#,
+            max = u64::MAX,
+            p0 = nonzero_hex(10),
+            b0 = nonzero_hex(11),
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+        );
+        let outputs = r#"[
+          {"amount":0,"pubkey_hex":"0101010101010101010101010101010101010101010101010101010101010101","blinding_hex":"0202020202020202020202020202020202020202020202020202020202020202"},
+          {"amount":0,"pubkey_hex":"0303030303030303030303030303030303030303030303030303030303030303","blinding_hex":"0404040404040404040404040404040404040404040404040404040404040404"}
+        ]"#;
+        let err =
+            prove_transfer_v2_inner(&[], &nonzero_hex(99), ZERO_HEX, &inputs, outputs).unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    // ---------- prove_transfer_v2_inner: zero blinding on input -----------------
+
+    #[test]
+    fn transfer_v2_rejects_zero_input_blinding() {
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{p}","blinding_hex":"{zero}","path_hex":[],"indices":[]}},
+              {{"amount":100,"privkey_hex":"{p2}","blinding_hex":"{b}","path_hex":[],"indices":[]}}
+            ]"#,
+            p = nonzero_hex(10),
+            zero = ZERO_HEX,
+            p2 = nonzero_hex(12),
+            b = nonzero_hex(13),
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":100,"pubkey_hex":"{pk}","blinding_hex":"{b1}"}},
+              {{"amount":100,"pubkey_hex":"{pk2}","blinding_hex":"{b2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            b1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            b2 = nonzero_hex(23),
+        );
+        let err = prove_transfer_v2_inner(&[], &nonzero_hex(99), ZERO_HEX, &inputs, &outputs)
+            .unwrap_err();
+        assert!(
+            err.contains("blinding") && err.contains("all-zero"),
+            "{err}"
+        );
+    }
+
+    // ---------- prove_transfer_v2_inner: zero privkey on input ------------------
+
+    #[test]
+    fn transfer_v2_rejects_zero_input_privkey() {
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{zero}","blinding_hex":"{b}","path_hex":[],"indices":[]}},
+              {{"amount":100,"privkey_hex":"{p2}","blinding_hex":"{b2}","path_hex":[],"indices":[]}}
+            ]"#,
+            zero = ZERO_HEX,
+            b = nonzero_hex(11),
+            p2 = nonzero_hex(12),
+            b2 = nonzero_hex(13),
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":100,"pubkey_hex":"{pk}","blinding_hex":"{b1}"}},
+              {{"amount":100,"pubkey_hex":"{pk2}","blinding_hex":"{b2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            b1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            b2 = nonzero_hex(23),
+        );
+        let err = prove_transfer_v2_inner(&[], &nonzero_hex(99), ZERO_HEX, &inputs, &outputs)
+            .unwrap_err();
+        assert!(err.contains("privkey") && err.contains("all-zero"), "{err}");
+    }
+
+    // ---------- prove_transfer_v2_inner: reused blindings -----------------------
+
+    #[test]
+    fn transfer_v2_rejects_reused_blindings() {
+        let same_blinding = nonzero_hex(42);
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{p0}","blinding_hex":"{same}","path_hex":[],"indices":[]}},
+              {{"amount":100,"privkey_hex":"{p1}","blinding_hex":"{b1}","path_hex":[],"indices":[]}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            same = same_blinding,
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":100,"pubkey_hex":"{pk}","blinding_hex":"{same}"}},
+              {{"amount":100,"pubkey_hex":"{pk2}","blinding_hex":"{b2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            same = same_blinding,
+            pk2 = nonzero_hex(22),
+            b2 = nonzero_hex(23),
+        );
+        let err = prove_transfer_v2_inner(&[], &nonzero_hex(99), ZERO_HEX, &inputs, &outputs)
+            .unwrap_err();
+        assert!(err.contains("pairwise distinct"), "{err}");
+    }
+
+    // ---------- prove_transfer_v2_inner: zero output blinding -------------------
+
+    #[test]
+    fn transfer_v2_rejects_zero_output_blinding() {
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{p0}","blinding_hex":"{b0}","path_hex":[],"indices":[]}},
+              {{"amount":100,"privkey_hex":"{p1}","blinding_hex":"{b1}","path_hex":[],"indices":[]}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            b0 = nonzero_hex(11),
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":100,"pubkey_hex":"{pk}","blinding_hex":"{zero}"}},
+              {{"amount":100,"pubkey_hex":"{pk2}","blinding_hex":"{b2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            zero = ZERO_HEX,
+            pk2 = nonzero_hex(22),
+            b2 = nonzero_hex(23),
+        );
+        let err = prove_transfer_v2_inner(&[], &nonzero_hex(99), ZERO_HEX, &inputs, &outputs)
+            .unwrap_err();
+        assert!(
+            err.contains("blinding") && err.contains("all-zero"),
+            "{err}"
+        );
+    }
+
+    // ---------- prove_transact_inner: zero root ---------------------------------
+
+    #[test]
+    fn transact_rejects_zero_root() {
+        let err =
+            prove_transact_inner(&[], ZERO_HEX, 0, ZERO_HEX, ZERO_HEX, "[]", "[]").unwrap_err();
+        assert!(err.contains("all-zero Merkle root"), "{err}");
+    }
+
+    // ---------- prove_transact_inner: u64 overflow on inputs --------------------
+
+    fn make_path_json() -> String {
+        let zero_sib = ZERO_HEX.to_string();
+        let path: Vec<&str> = (0..TX_LEVELS).map(|_| zero_sib.as_str()).collect();
+        serde_json::to_string(&path).unwrap()
+    }
+
+    #[test]
+    fn transact_rejects_input_overflow() {
+        let path_json = make_path_json();
+        let inputs = format!(
+            r#"[
+              {{"amount":{max},"privkey_hex":"{p0}","blinding_hex":"{b0}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":1,"privkey_hex":"{p1}","blinding_hex":"{b1}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            max = u64::MAX,
+            p0 = nonzero_hex(10),
+            b0 = nonzero_hex(11),
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+            path = path_json,
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":0,"pubkey_hex":"{pk}","blinding_hex":"{b1}"}},
+              {{"amount":0,"pubkey_hex":"{pk2}","blinding_hex":"{b2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            b1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            b2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    // ---------- prove_transact_inner: u64 overflow on outputs -------------------
+
+    #[test]
+    fn transact_rejects_output_overflow() {
+        let path_json = make_path_json();
+        let inputs = format!(
+            r#"[
+              {{"amount":0,"privkey_hex":"{p0}","blinding_hex":"{b0}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":0,"privkey_hex":"{p1}","blinding_hex":"{b1}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            b0 = nonzero_hex(11),
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+            path = path_json,
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":{max},"pubkey_hex":"{pk}","blinding_hex":"{b1}"}},
+              {{"amount":1,"pubkey_hex":"{pk2}","blinding_hex":"{b2}"}}
+            ]"#,
+            max = u64::MAX,
+            pk = nonzero_hex(20),
+            b1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            b2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    // ---------- prove_transact_inner: zero input privkey -------------------------
+
+    #[test]
+    fn transact_rejects_zero_input_privkey() {
+        let path_json = make_path_json();
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{zero}","blinding_hex":"{b0}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":0,"privkey_hex":"{p1}","blinding_hex":"{b1}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            zero = ZERO_HEX,
+            b0 = nonzero_hex(11),
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+            path = path_json,
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":50,"pubkey_hex":"{pk}","blinding_hex":"{ob1}"}},
+              {{"amount":50,"pubkey_hex":"{pk2}","blinding_hex":"{ob2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            ob1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            ob2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(err.contains("privkey") && err.contains("all-zero"), "{err}");
+    }
+
+    // ---------- prove_transact_inner: zero input blinding -----------------------
+
+    #[test]
+    fn transact_rejects_zero_input_blinding() {
+        let path_json = make_path_json();
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{p0}","blinding_hex":"{zero}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":0,"privkey_hex":"{p1}","blinding_hex":"{b1}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            zero = ZERO_HEX,
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+            path = path_json,
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":50,"pubkey_hex":"{pk}","blinding_hex":"{ob1}"}},
+              {{"amount":50,"pubkey_hex":"{pk2}","blinding_hex":"{ob2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            ob1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            ob2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("blinding") && err.contains("all-zero"),
+            "{err}"
+        );
+    }
+
+    // ---------- prove_transact_inner: zero output blinding ----------------------
+
+    #[test]
+    fn transact_rejects_zero_output_blinding() {
+        let path_json = make_path_json();
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{p0}","blinding_hex":"{b0}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":0,"privkey_hex":"{p1}","blinding_hex":"{b1}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            b0 = nonzero_hex(11),
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+            path = path_json,
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":50,"pubkey_hex":"{pk}","blinding_hex":"{zero}"}},
+              {{"amount":50,"pubkey_hex":"{pk2}","blinding_hex":"{ob2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            zero = ZERO_HEX,
+            pk2 = nonzero_hex(22),
+            ob2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("blinding") && err.contains("all-zero"),
+            "{err}"
+        );
+    }
+
+    // ---------- prove_transact_inner: reused blindings ---------------------------
+
+    #[test]
+    fn transact_rejects_reused_blindings_across_input_output() {
+        let path_json = make_path_json();
+        let same = nonzero_hex(42);
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{p0}","blinding_hex":"{same}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":0,"privkey_hex":"{p1}","blinding_hex":"{b1}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            same = same,
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+            path = path_json,
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":50,"pubkey_hex":"{pk}","blinding_hex":"{same}"}},
+              {{"amount":50,"pubkey_hex":"{pk2}","blinding_hex":"{ob2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            same = same,
+            pk2 = nonzero_hex(22),
+            ob2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(err.contains("pairwise distinct"), "{err}");
+    }
+
+    // ---------- prove_transact_inner: reused blindings between two inputs --------
+
+    #[test]
+    fn transact_rejects_reused_blindings_across_two_inputs() {
+        let path_json = make_path_json();
+        let same = nonzero_hex(42);
+        let inputs = format!(
+            r#"[
+              {{"amount":50,"privkey_hex":"{p0}","blinding_hex":"{same}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":50,"privkey_hex":"{p1}","blinding_hex":"{same}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            same = same,
+            p1 = nonzero_hex(12),
+            path = path_json,
+        );
+        let outputs = format!(
+            r#"[
+              {{"amount":50,"pubkey_hex":"{pk}","blinding_hex":"{ob1}"}},
+              {{"amount":50,"pubkey_hex":"{pk2}","blinding_hex":"{ob2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            ob1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            ob2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(err.contains("pairwise distinct"), "{err}");
+    }
+
+    // ---------- prove_transact_inner: value conservation check -------------------
+
+    #[test]
+    fn transact_rejects_value_not_conserved() {
+        let path_json = make_path_json();
+        let inputs = format!(
+            r#"[
+              {{"amount":100,"privkey_hex":"{p0}","blinding_hex":"{b0}","leaf_index":0,"path_hex":{path}}},
+              {{"amount":0,"privkey_hex":"{p1}","blinding_hex":"{b1}","leaf_index":1,"path_hex":{path}}}
+            ]"#,
+            p0 = nonzero_hex(10),
+            b0 = nonzero_hex(11),
+            p1 = nonzero_hex(12),
+            b1 = nonzero_hex(13),
+            path = path_json,
+        );
+        // ext_amount = 0, so outputs should sum to 100, but we put 200
+        let outputs = format!(
+            r#"[
+              {{"amount":150,"pubkey_hex":"{pk}","blinding_hex":"{ob1}"}},
+              {{"amount":50,"pubkey_hex":"{pk2}","blinding_hex":"{ob2}"}}
+            ]"#,
+            pk = nonzero_hex(20),
+            ob1 = nonzero_hex(21),
+            pk2 = nonzero_hex(22),
+            ob2 = nonzero_hex(23),
+        );
+        let err = prove_transact_inner(
+            &[],
+            &nonzero_hex(99),
+            0,
+            &nonzero_hex(88),
+            ZERO_HEX,
+            &inputs,
+            &outputs,
+        )
+        .unwrap_err();
+        assert!(err.contains("value not conserved"), "{err}");
+    }
 }

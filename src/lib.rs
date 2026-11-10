@@ -12,6 +12,7 @@
 pub mod privacy;
 
 use ark_bn254::{Bn254, Fr};
+use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -26,6 +27,109 @@ use privacy::poseidon::{
     poseidon_signature,
 };
 use sha2::{Digest, Sha256};
+
+const VK_GAMMA_ABC_LEN_OFFSET: usize = 32 + 64 + 64 + 64; // alpha_g1(32) + beta_g2(64) + gamma_g2(64) + delta_g2(64)
+const MAX_GAMMA_ABC_LEN: u64 = 64;
+
+fn deserialize_proving_key_bounded(
+    proving_key: &[u8],
+    context: &str,
+) -> Result<ProvingKey<Bn254>, String> {
+    if proving_key.len() < VK_GAMMA_ABC_LEN_OFFSET + 8 {
+        return Err(format!(
+            "{context}: proving key buffer too short ({} bytes)",
+            proving_key.len()
+        ));
+    }
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&proving_key[VK_GAMMA_ABC_LEN_OFFSET..VK_GAMMA_ABC_LEN_OFFSET + 8]);
+    let gamma_abc_len = u64::from_le_bytes(len_bytes);
+    if gamma_abc_len == 0 || gamma_abc_len > MAX_GAMMA_ABC_LEN {
+        return Err(format!(
+            "{context}: invalid proving key gamma_abc_g1 length prefix ({gamma_abc_len})"
+        ));
+    }
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+        .map_err(|e| format!("bad proving key: {e}"))?;
+    if pk.b_g1_query.len() != pk.b_g2_query.len() {
+        return Err(format!(
+            "{context}: b_g1_query length ({}) != b_g2_query length ({})",
+            pk.b_g1_query.len(),
+            pk.b_g2_query.len()
+        ));
+    }
+    if pk.a_query.len() < pk.vk.gamma_abc_g1.len() {
+        return Err(format!(
+            "{context}: a_query length ({}) < gamma_abc_g1 length ({})",
+            pk.a_query.len(),
+            pk.vk.gamma_abc_g1.len()
+        ));
+    }
+    if pk.l_query.is_empty() || pk.l_query.iter().all(|p| p.is_zero()) {
+        return Err(format!(
+            "{context}: proving key l_query is empty or all-zero"
+        ));
+    }
+    if pk.h_query.is_empty() || pk.h_query.iter().all(|p| p.is_zero()) {
+        return Err(format!(
+            "{context}: proving key h_query is empty or all-zero"
+        ));
+    }
+    Ok(pk)
+}
+
+fn validate_output_against_input_artifacts(
+    pubkey: &[u8; 32],
+    blinding: &[u8; 32],
+    input_commitments: &[[u8; 32]],
+    nullifiers: &[[u8; 32]],
+    input_signatures: &[[u8; 32]],
+    context: &str,
+) -> Result<(), String> {
+    if input_commitments.contains(pubkey)
+        || nullifiers.contains(pubkey)
+        || input_signatures.contains(pubkey)
+        || input_commitments.contains(blinding)
+        || nullifiers.contains(blinding)
+        || input_signatures.contains(blinding)
+    {
+        return Err(format!(
+            "{context}: output pubkey or blinding collides with input commitment, nullifier, or spend signature"
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_withdrawal_recipient_distinct(
+    recipient: &[u8; 32],
+    in_privkeys: &[[u8; 32]],
+    in_blindings: &[[u8; 32]],
+    out_blindings: &[[u8; 32]],
+    in_pubkeys: &[[u8; 32]],
+    out_pubkeys: &[[u8; 32]],
+    in_commitments: &[[u8; 32]],
+    out_commitments: &[[u8; 32]],
+    nullifiers: &[[u8; 32]],
+    signatures: &[[u8; 32]],
+    context: &str,
+) -> Result<(), String> {
+    if in_privkeys.contains(recipient)
+        || in_blindings.contains(recipient)
+        || out_blindings.contains(recipient)
+        || in_pubkeys.contains(recipient)
+        || out_pubkeys.contains(recipient)
+        || in_commitments.contains(recipient)
+        || out_commitments.contains(recipient)
+        || nullifiers.contains(recipient)
+        || signatures.contains(recipient)
+    {
+        return Err(format!(
+            "{context}: withdrawal recipient collides with shielded pubkey, commitment, nullifier, signature, or secret witness"
+        ));
+    }
+    Ok(())
+}
 
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut v = fr.into_bigint().to_bytes_le();
@@ -188,15 +292,34 @@ pub fn prove_withdrawal_v2(
     let leaf_index = leaf_index_from(&indices);
 
     let sk = Fr::from_le_bytes_mod_order(&privkey);
+    let pubkey_fr = poseidon_pubkey(sk);
+    let pubkey_bytes = fr_to_le_bytes_32(pubkey_fr);
     let commitment_fr = poseidon_commit_spend(
         Fr::from(amount),
-        poseidon_pubkey(sk),
+        pubkey_fr,
         Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&asset_id),
     );
+    let commitment_bytes = fr_to_le_bytes_32(commitment_fr);
     let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
+    let signature_bytes = fr_to_le_bytes_32(signature);
     let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
     let nullifier = fr_to_le_bytes_32(nullifier_fr);
+
+    validate_withdrawal_recipient_distinct(
+        &dest_recipient,
+        &[privkey],
+        &[blinding],
+        &[],
+        &[pubkey_bytes],
+        &[],
+        &[commitment_bytes],
+        &[],
+        &[nullifier],
+        &[signature_bytes],
+        "prove_withdrawal_v2",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     // ext_data_hash = sha256(recipient || amount_le), identical to the program's
     // `withdraw_ext_data_hash`.
@@ -217,8 +340,8 @@ pub fn prove_withdrawal_v2(
         input_path: Some(merkle_path),
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = deserialize_proving_key_bounded(proving_key, "prove_withdrawal_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -301,6 +424,8 @@ pub fn prove_transfer_v2(
     }
 
     let mut nullifiers = Vec::with_capacity(2);
+    let mut input_commitments = Vec::with_capacity(2);
+    let mut input_signatures = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
@@ -318,6 +443,8 @@ pub fn prove_transfer_v2(
         let leaf_index = leaf_index_from(&inp.indices);
         let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
         let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
+        input_commitments.push(fr_to_le_bytes_32(commitment_fr));
+        input_signatures.push(fr_to_le_bytes_32(signature));
         nullifiers.push(fr_to_le_bytes_32(nullifier_fr));
         input_values.push(inp.amount);
         input_blindings.push(blinding);
@@ -332,6 +459,15 @@ pub fn prove_transfer_v2(
     for out in &outputs {
         let blinding = hex32(&out.blinding_hex)?;
         let pubkey = hex32(&out.pubkey_hex)?;
+        validate_output_against_input_artifacts(
+            &pubkey,
+            &blinding,
+            &input_commitments,
+            &nullifiers,
+            &input_signatures,
+            "prove_transfer_v2",
+        )
+        .map_err(|e| JsValue::from_str(&e))?;
         let commitment_fr = poseidon_commit_spend(
             Fr::from(out.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -358,8 +494,8 @@ pub fn prove_transfer_v2(
         asset_id,
     );
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = deserialize_proving_key_bounded(proving_key, "prove_transfer_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -518,6 +654,9 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
+    let mut in_derived_pubkeys = Vec::new();
+    let mut in_commitments = Vec::new();
+    let mut in_signatures = Vec::new();
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
         let blinding = hex32(&inp.blinding_hex)?;
@@ -533,14 +672,18 @@ pub fn prove_transact(
         }
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let pk_fr = v3_pubkey(sk);
         let c = v3_commit(
             Fr::from(inp.amount),
-            v3_pubkey(sk),
+            pk_fr,
             Fr::from_le_bytes_mod_order(&blinding),
             asset,
         );
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
+        in_derived_pubkeys.push(fr_to_le_bytes_32(pk_fr));
+        in_commitments.push(fr_to_le_bytes_32(c));
+        in_signatures.push(fr_to_le_bytes_32(sig));
         nullifiers.push(fr_to_le_bytes_32(nf));
 
         in_amounts.push(Some(inp.amount));
@@ -553,10 +696,21 @@ pub fn prove_transact(
     let mut out_amounts = Vec::new();
     let mut out_pubkeys = Vec::new();
     let mut out_blindings = Vec::new();
+    let mut out_pubkey_raw = Vec::new();
+    let mut out_blinding_raw = Vec::new();
     let mut output_commitments = Vec::new();
     for outp in &outputs {
         let pubkey = hex32(&outp.pubkey_hex)?;
         let blinding = hex32(&outp.blinding_hex)?;
+        validate_output_against_input_artifacts(
+            &pubkey,
+            &blinding,
+            &in_commitments,
+            &nullifiers,
+            &in_signatures,
+            "prove_transact",
+        )
+        .map_err(|e| JsValue::from_str(&e))?;
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -567,6 +721,27 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+        out_pubkey_raw.push(pubkey);
+        out_blinding_raw.push(blinding);
+    }
+
+    if ext_amount < 0 {
+        let raw_in_privkeys: Vec<[u8; 32]> = in_privkeys.iter().flatten().copied().collect();
+        let raw_in_blindings: Vec<[u8; 32]> = in_blindings.iter().flatten().copied().collect();
+        validate_withdrawal_recipient_distinct(
+            &recipient,
+            &raw_in_privkeys,
+            &raw_in_blindings,
+            &out_blinding_raw,
+            &in_derived_pubkeys,
+            &out_pubkey_raw,
+            &in_commitments,
+            &output_commitments,
+            &nullifiers,
+            &in_signatures,
+            "prove_transact",
+        )
+        .map_err(|e| JsValue::from_str(&e))?;
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =
@@ -602,8 +777,8 @@ pub fn prove_transact(
         out_blindings,
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = deserialize_proving_key_bounded(proving_key, "prove_transact")
+        .map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -643,6 +818,7 @@ pub fn prove_transact(
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
@@ -688,4 +864,179 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod issue_57_tests {
+    use super::*;
+    use ark_bn254::{G1Affine, G2Affine};
+    use ark_ec::CurveGroup;
+
+    #[test]
+    fn deserialize_proving_key_bounded_rejects_corrupted_length_prefix_and_zero_queries() {
+        // Short buffer rejected without panic.
+        assert!(deserialize_proving_key_bounded(&[0u8; 64], "test").is_err());
+
+        // Corrupted huge gamma_abc_g1 u64 length prefix at offset 224..232 is rejected before Vec::with_capacity OOM.
+        let mut bad_header = vec![0u8; 240];
+        bad_header[VK_GAMMA_ABC_LEN_OFFSET..VK_GAMMA_ABC_LEN_OFFSET + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(deserialize_proving_key_bounded(&bad_header, "test").is_err());
+
+        // Zero gamma_abc_g1 count rejected.
+        let mut zero_header = vec![0u8; 240];
+        zero_header[VK_GAMMA_ABC_LEN_OFFSET..VK_GAMMA_ABC_LEN_OFFSET + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        assert!(deserialize_proving_key_bounded(&zero_header, "test").is_err());
+
+        let g1_a = G1Affine::generator();
+        let g1_b = (g1_a + g1_a).into_affine();
+        let g2_a = G2Affine::generator();
+        let vk = ark_groth16::VerifyingKey::<Bn254> {
+            alpha_g1: g1_a,
+            beta_g2: g2_a,
+            gamma_g2: g2_a,
+            delta_g2: g2_a,
+            gamma_abc_g1: vec![g1_a, g1_b],
+        };
+        let pk = ProvingKey::<Bn254> {
+            vk,
+            beta_g1: g1_a,
+            delta_g1: g1_b,
+            a_query: vec![g1_a, g1_b],
+            b_g1_query: vec![g1_a, g1_b],
+            b_g2_query: vec![g2_a, g2_a],
+            h_query: vec![g1_a],
+            l_query: vec![g1_a],
+        };
+        let mut valid_bytes = Vec::new();
+        pk.serialize_compressed(&mut valid_bytes).unwrap();
+        assert!(deserialize_proving_key_bounded(&valid_bytes, "test").is_ok());
+
+        // Mismatched b_g1_query vs b_g2_query lengths rejected.
+        let mut mismatch_pk = pk.clone();
+        mismatch_pk.b_g2_query = vec![g2_a];
+        let mut mismatch_bytes = Vec::new();
+        mismatch_pk
+            .serialize_compressed(&mut mismatch_bytes)
+            .unwrap();
+        assert!(deserialize_proving_key_bounded(&mismatch_bytes, "test").is_err());
+
+        // a_query shorter than gamma_abc_g1 rejected.
+        let mut short_a_pk = pk.clone();
+        short_a_pk.a_query = vec![g1_a];
+        let mut short_a_bytes = Vec::new();
+        short_a_pk.serialize_compressed(&mut short_a_bytes).unwrap();
+        assert!(deserialize_proving_key_bounded(&short_a_bytes, "test").is_err());
+
+        // All-zero l_query rejected.
+        let mut zero_l_pk = pk.clone();
+        zero_l_pk.l_query = vec![G1Affine::zero()];
+        let mut zero_l_bytes = Vec::new();
+        zero_l_pk.serialize_compressed(&mut zero_l_bytes).unwrap();
+        assert!(deserialize_proving_key_bounded(&zero_l_bytes, "test").is_err());
+
+        // All-zero h_query rejected.
+        let mut zero_h_pk = pk;
+        zero_h_pk.h_query = vec![G1Affine::zero()];
+        let mut zero_h_bytes = Vec::new();
+        zero_h_pk.serialize_compressed(&mut zero_h_bytes).unwrap();
+        assert!(deserialize_proving_key_bounded(&zero_h_bytes, "test").is_err());
+    }
+
+    #[test]
+    fn recipient_and_output_collision_guards_reject_shielded_and_secret_reuse() {
+        let sk = [11u8; 32];
+        let bl = [22u8; 32];
+        let out_bl = [33u8; 32];
+        let in_pk = fr_to_le_bytes_32(v3_pubkey(Fr::from_le_bytes_mod_order(&sk)));
+        let out_pk = fr_to_le_bytes_32(v3_pubkey(Fr::from(44u64)));
+        let c0 = fr_to_le_bytes_32(v3_commit(
+            Fr::from(1000u64),
+            Fr::from_le_bytes_mod_order(&in_pk),
+            Fr::from_le_bytes_mod_order(&bl),
+            Fr::from(0u64),
+        ));
+        let sig0 = fr_to_le_bytes_32(v3_signature(
+            Fr::from_le_bytes_mod_order(&sk),
+            Fr::from_le_bytes_mod_order(&c0),
+            Fr::from(0u64),
+        ));
+        let nf0 = fr_to_le_bytes_32(v3_nullifier(
+            Fr::from_le_bytes_mod_order(&c0),
+            Fr::from(0u64),
+            Fr::from_le_bytes_mod_order(&sig0),
+        ));
+        let oc0 = fr_to_le_bytes_32(v3_commit(
+            Fr::from(500u64),
+            Fr::from_le_bytes_mod_order(&out_pk),
+            Fr::from_le_bytes_mod_order(&out_bl),
+            Fr::from(0u64),
+        ));
+
+        // Distinct L1 recipient and output artifacts succeed.
+        assert!(validate_output_against_input_artifacts(
+            &out_pk,
+            &out_bl,
+            &[c0],
+            &[nf0],
+            &[sig0],
+            "test"
+        )
+        .is_ok());
+        assert!(validate_withdrawal_recipient_distinct(
+            &[99u8; 32],
+            &[sk],
+            &[bl],
+            &[out_bl],
+            &[in_pk],
+            &[out_pk],
+            &[c0],
+            &[oc0],
+            &[nf0],
+            &[sig0],
+            "test"
+        )
+        .is_ok());
+
+        // Output pubkey or blinding colliding with input commitment, nullifier, or signature fails.
+        for bad in [c0, nf0, sig0] {
+            assert!(validate_output_against_input_artifacts(
+                &bad,
+                &out_bl,
+                &[c0],
+                &[nf0],
+                &[sig0],
+                "test"
+            )
+            .is_err());
+            assert!(validate_output_against_input_artifacts(
+                &out_pk,
+                &bad,
+                &[c0],
+                &[nf0],
+                &[sig0],
+                "test"
+            )
+            .is_err());
+        }
+
+        // Withdrawal recipient colliding with shielded pubkey, commitment, nullifier, signature, or secret witness fails.
+        for bad_rec in [sk, bl, out_bl, in_pk, out_pk, c0, oc0, nf0, sig0] {
+            assert!(validate_withdrawal_recipient_distinct(
+                &bad_rec,
+                &[sk],
+                &[bl],
+                &[out_bl],
+                &[in_pk],
+                &[out_pk],
+                &[c0],
+                &[oc0],
+                &[nf0],
+                &[sig0],
+                "test"
+            )
+            .is_err());
+        }
+    }
 }

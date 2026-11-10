@@ -18,12 +18,12 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use wasm_bindgen::prelude::*;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
 use privacy::poseidon::{
-    poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
-    poseidon_signature,
+    poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier_spend,
+    poseidon_pubkey, poseidon_signature,
 };
 use sha2::{Digest, Sha256};
 
@@ -35,14 +35,46 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
-fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+/// The v2 empty-tree Merkle root for a depth-32 tree with 0 leaves.
+pub fn v2_empty_tree_root_bytes() -> [u8; 32] {
+    let mut node = Fr::from(0u64);
+    for _ in 0..32 {
+        node = poseidon_merkle_pair(node, node);
+    }
+    fr_to_le_bytes_32(node)
+}
+
+pub fn hex32_inner(s: &str) -> Result<[u8; 32], String> {
+    let b = hex::decode(s.trim()).map_err(|e| format!("bad hex: {e}"))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err("expected 32-byte hex".to_string());
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
+    hex32_inner(s).map_err(|e| JsValue::from_str(&e))
+}
+
+pub fn note_commitment_inner(
+    amount: u64,
+    randomness_hex: &str,
+    recipient_hex: &str,
+) -> Result<String, String> {
+    let randomness = hex32_inner(randomness_hex)?;
+    let recipient = hex32_inner(recipient_hex)?;
+    if randomness == recipient {
+        return Err("randomness and recipient must not collide".to_string());
+    }
+    let c = poseidon_commit(
+        Fr::from(amount),
+        Fr::from_le_bytes_mod_order(&randomness),
+        Fr::from_le_bytes_mod_order(&recipient),
+        Fr::from(0u64), // native-SOL asset id (#235)
+    );
+    Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -53,15 +85,12 @@ pub fn note_commitment(
     randomness_hex: &str,
     recipient_hex: &str,
 ) -> Result<String, JsValue> {
-    let randomness = hex32(randomness_hex)?;
-    let recipient = hex32(recipient_hex)?;
-    let c = poseidon_commit(
-        Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&randomness),
-        Fr::from_le_bytes_mod_order(&recipient),
-        Fr::from(0u64), // native-SOL asset id (#235)
-    );
-    Ok(hex::encode(fr_to_le_bytes_32(c)))
+    note_commitment_inner(amount, randomness_hex, recipient_hex).map_err(|e| JsValue::from_str(&e))
+}
+
+pub fn spend_pubkey_inner(privkey_hex: &str) -> Result<String, String> {
+    let sk = Fr::from_le_bytes_mod_order(&hex32_inner(privkey_hex)?);
+    Ok(hex::encode(fr_to_le_bytes_32(poseidon_pubkey(sk))))
 }
 
 /// Derive the v2 spend public key.
@@ -75,8 +104,29 @@ pub fn note_commitment(
 /// [`v3_note_pubkey`], which uses circom Poseidon and is not interchangeable.
 #[wasm_bindgen]
 pub fn spend_pubkey(privkey_hex: &str) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
-    Ok(hex::encode(fr_to_le_bytes_32(poseidon_pubkey(sk))))
+    spend_pubkey_inner(privkey_hex).map_err(|e| JsValue::from_str(&e))
+}
+
+pub fn note_commitment_v2_inner(
+    amount: u64,
+    privkey_hex: &str,
+    blinding_hex: &str,
+    asset_id_hex: &str,
+) -> Result<String, String> {
+    let privkey = hex32_inner(privkey_hex)?;
+    let blinding = hex32_inner(blinding_hex)?;
+    if privkey == blinding {
+        return Err("privkey and blinding must not collide".to_string());
+    }
+    let asset_id = hex32_inner(asset_id_hex)?;
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
+    let c = poseidon_commit_spend(
+        Fr::from(amount),
+        poseidon_pubkey(sk),
+        Fr::from_le_bytes_mod_order(&blinding),
+        Fr::from_le_bytes_mod_order(&asset_id),
+    );
+    Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
 
 /// The v2 note commitment,
@@ -96,14 +146,8 @@ pub fn note_commitment_v2(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
-    let sk = Fr::from_le_bytes_mod_order(&hex32(privkey_hex)?);
-    let c = poseidon_commit_spend(
-        Fr::from(amount),
-        poseidon_pubkey(sk),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
-    );
-    Ok(hex::encode(fr_to_le_bytes_32(c)))
+    note_commitment_v2_inner(amount, privkey_hex, blinding_hex, asset_id_hex)
+        .map_err(|e| JsValue::from_str(&e))
 }
 
 fn rng_from_entropy() -> StdRng {
@@ -112,19 +156,27 @@ fn rng_from_entropy() -> StdRng {
     StdRng::from_seed(seed)
 }
 
+fn merkle_path_from_inner(
+    path_hex: &[String],
+    indices: &[bool],
+) -> Result<Vec<([u8; 32], bool)>, String> {
+    if path_hex.len() != indices.len() {
+        return Err("path and indices length mismatch".to_string());
+    }
+    let mut path = Vec::with_capacity(path_hex.len());
+    for (h, dir) in path_hex.iter().zip(indices) {
+        path.push((hex32_inner(h)?, *dir));
+    }
+    Ok(path)
+}
+
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
+#[allow(dead_code)]
 fn merkle_path_from(
     path_hex: &[String],
     indices: &[bool],
 ) -> Result<Vec<([u8; 32], bool)>, JsValue> {
-    if path_hex.len() != indices.len() {
-        return Err(JsValue::from_str("path and indices length mismatch"));
-    }
-    let mut path = Vec::with_capacity(path_hex.len());
-    for (h, dir) in path_hex.iter().zip(indices) {
-        path.push((hex32(h)?, *dir));
-    }
-    Ok(path)
+    merkle_path_from_inner(path_hex, indices).map_err(|e| JsValue::from_str(&e))
 }
 
 /// Leaf index from a path's direction bits: a level adds `2^level` when the
@@ -141,28 +193,8 @@ fn leaf_index_from(indices: &[bool]) -> u64 {
     idx
 }
 
-/// Prove a spend-key withdrawal (circuit v2, #293).
-///
-/// Spend authority is the note's private key rather than a free secret: the commitment binds `Poseidon(privkey)` and the
-/// nullifier folds in a signature over `(commitment, leaf_index)`, so only the
-/// key-holder can spend and a note at a tree position yields exactly one
-/// nullifier. The proof also commits to the withdrawal's `asset_id` (finding A)
-/// and `ext_data_hash` (finding D), the latter derived here exactly as the
-/// on-chain program does: `sha256(dest_recipient || amount.to_le_bytes())`. The
-/// program recomputes both from the vault mint and the recipient it pays, so a
-/// proof cannot be replayed against another asset or redirected.
-///
-/// - `proving_key`: the v2 ceremony proving key bytes (withdraw_v2_proving.key)
-/// - `privkey_hex`, `blinding_hex`, `asset_id_hex`: the note's spend key,
-///   blinding and asset id (32-byte hex; asset id all-zero for native SOL)
-/// - `dest_recipient_hex`: the on-chain Solana destination the funds are paid to
-/// - `path_hex_json` / `indices_json`: the root-less Merkle path and its
-///   direction bits
-///
-/// Returns `{ nullifier, proof }` (hex).
-#[wasm_bindgen]
 #[allow(clippy::too_many_arguments)]
-pub fn prove_withdrawal_v2(
+pub fn prove_withdrawal_v2_inner(
     proving_key: &[u8],
     root_hex: &str,
     amount: u64,
@@ -172,18 +204,37 @@ pub fn prove_withdrawal_v2(
     dest_recipient_hex: &str,
     path_hex_json: &str,
     indices_json: &str,
-) -> Result<String, JsValue> {
-    let root = hex32(root_hex)?;
-    let blinding = hex32(blinding_hex)?;
-    let privkey = hex32(privkey_hex)?;
-    let asset_id = hex32(asset_id_hex)?;
-    let dest_recipient = hex32(dest_recipient_hex)?;
+) -> Result<String, String> {
+    let root = hex32_inner(root_hex)?;
+    if root == [0u8; 32] || root == v2_empty_tree_root_bytes() {
+        return Err("empty-tree root is rejected".to_string());
+    }
+    let blinding = hex32_inner(blinding_hex)?;
+    let privkey = hex32_inner(privkey_hex)?;
+    if privkey == blinding {
+        return Err("privkey and blinding must not collide".to_string());
+    }
+    let asset_id = hex32_inner(asset_id_hex)?;
+    let dest_recipient = hex32_inner(dest_recipient_hex)?;
 
-    let path_hex: Vec<String> = serde_json::from_str(path_hex_json)
-        .map_err(|e| JsValue::from_str(&format!("bad path json: {e}")))?;
-    let indices: Vec<bool> = serde_json::from_str(indices_json)
-        .map_err(|e| JsValue::from_str(&format!("bad indices json: {e}")))?;
-    let merkle_path = merkle_path_from(&path_hex, &indices)?;
+    let sk = Fr::from_le_bytes_mod_order(&privkey);
+    let in_pubkey = fr_to_le_bytes_32(poseidon_pubkey(sk));
+
+    if dest_recipient == privkey {
+        return Err("withdrawal recipient must not collide with spend privkey".to_string());
+    }
+    if dest_recipient == blinding {
+        return Err("withdrawal recipient must not collide with blinding".to_string());
+    }
+    if dest_recipient == in_pubkey {
+        return Err("withdrawal recipient must not collide with spend pubkey".to_string());
+    }
+
+    let path_hex: Vec<String> =
+        serde_json::from_str(path_hex_json).map_err(|e| format!("bad path json: {e}"))?;
+    let indices: Vec<bool> =
+        serde_json::from_str(indices_json).map_err(|e| format!("bad indices json: {e}"))?;
+    let merkle_path = merkle_path_from_inner(&path_hex, &indices)?;
 
     let leaf_index = leaf_index_from(&indices);
 
@@ -218,15 +269,15 @@ pub fn prove_withdrawal_v2(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| format!("bad proving key: {e}"))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| format!("prove failed: {e}"))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| format!("serialize failed: {e}"))?;
 
     Ok(format!(
         "{{\"nullifier\":\"{}\",\"proof\":\"{}\"}}",
@@ -235,10 +286,56 @@ pub fn prove_withdrawal_v2(
     ))
 }
 
+/// Prove a spend-key withdrawal (circuit v2, #293).
+///
+/// Spend authority is the note's private key rather than a free secret: the commitment binds `Poseidon(privkey)` and the
+/// nullifier folds in a signature over `(commitment, leaf_index)`, so only the
+/// key-holder can spend and a note at a tree position yields exactly one
+/// nullifier. The proof also commits to the withdrawal's `asset_id` (finding A)
+/// and `ext_data_hash` (finding D), the latter derived here exactly as the
+/// on-chain program does: `sha256(dest_recipient || amount.to_le_bytes())`. The
+/// program recomputes both from the vault mint and the recipient it pays, so a
+/// proof cannot be replayed against another asset or redirected.
+///
+/// - `proving_key`: the v2 ceremony proving key bytes (withdraw_v2_proving.key)
+/// - `privkey_hex`, `blinding_hex`, `asset_id_hex`: the note's spend key,
+///   blinding and asset id (32-byte hex; asset id all-zero for native SOL)
+/// - `dest_recipient_hex`: the on-chain Solana destination the funds are paid to
+/// - `path_hex_json` / `indices_json`: the root-less Merkle path and its
+///   direction bits
+///
+/// Returns `{ nullifier, proof }` (hex).
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_withdrawal_v2(
+    proving_key: &[u8],
+    root_hex: &str,
+    amount: u64,
+    blinding_hex: &str,
+    privkey_hex: &str,
+    asset_id_hex: &str,
+    dest_recipient_hex: &str,
+    path_hex_json: &str,
+    indices_json: &str,
+) -> Result<String, JsValue> {
+    prove_withdrawal_v2_inner(
+        proving_key,
+        root_hex,
+        amount,
+        blinding_hex,
+        privkey_hex,
+        asset_id_hex,
+        dest_recipient_hex,
+        path_hex_json,
+        indices_json,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
 /// An input note being spent in a transfer. `path_hex`/`indices` are the
 /// root-less Merkle path proving the note's commitment is in the tree, pulled
 /// from the path server.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TransferInputV2 {
     amount: u64,
     /// The note's spend key. Authority is knowledge of this, not of a free
@@ -253,12 +350,135 @@ struct TransferInputV2 {
 }
 
 /// An output note being created. A value-0 note is a valid "empty" output.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TransferOutputV2 {
     amount: u64,
     /// The recipient's spend *public* key, `Poseidon(privkey)`.
     pubkey_hex: String,
     blinding_hex: String,
+}
+
+pub fn prove_transfer_v2_inner(
+    proving_key: &[u8],
+    root_hex: &str,
+    asset_id_hex: &str,
+    inputs_json: &str,
+    outputs_json: &str,
+) -> Result<String, String> {
+    let root = hex32_inner(root_hex)?;
+    if root == [0u8; 32] || root == v2_empty_tree_root_bytes() {
+        return Err("empty-tree root is rejected".to_string());
+    }
+    let asset_id = hex32_inner(asset_id_hex)?;
+    let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
+
+    let inputs: Vec<TransferInputV2> =
+        serde_json::from_str(inputs_json).map_err(|e| format!("bad inputs json: {e}"))?;
+    let outputs: Vec<TransferOutputV2> =
+        serde_json::from_str(outputs_json).map_err(|e| format!("bad outputs json: {e}"))?;
+    if inputs.len() != 2 || outputs.len() != 2 {
+        return Err("transfer requires exactly 2 inputs and 2 outputs".to_string());
+    }
+
+    let mut nullifiers = Vec::with_capacity(2);
+    let mut input_values = Vec::with_capacity(2);
+    let mut input_blindings = Vec::with_capacity(2);
+    let mut input_privkeys = Vec::with_capacity(2);
+    let mut input_paths = Vec::with_capacity(2);
+    for inp in &inputs {
+        let blinding = hex32_inner(&inp.blinding_hex)?;
+        let privkey = hex32_inner(&inp.privkey_hex)?;
+        let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(inp.amount),
+            poseidon_pubkey(sk),
+            Fr::from_le_bytes_mod_order(&blinding),
+            asset_fr,
+        );
+        let leaf_index = leaf_index_from(&inp.indices);
+        let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
+        let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
+        nullifiers.push(fr_to_le_bytes_32(nullifier_fr));
+        input_values.push(inp.amount);
+        input_blindings.push(blinding);
+        input_privkeys.push(privkey);
+        input_paths.push(merkle_path_from_inner(&inp.path_hex, &inp.indices)?);
+    }
+
+    let mut output_commitments = Vec::with_capacity(2);
+    let mut output_values = Vec::with_capacity(2);
+    let mut output_blindings = Vec::with_capacity(2);
+    let mut output_pubkeys = Vec::with_capacity(2);
+    for out in &outputs {
+        let blinding = hex32_inner(&out.blinding_hex)?;
+        let pubkey = hex32_inner(&out.pubkey_hex)?;
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(out.amount),
+            Fr::from_le_bytes_mod_order(&pubkey),
+            Fr::from_le_bytes_mod_order(&blinding),
+            asset_fr,
+        );
+        output_commitments.push(fr_to_le_bytes_32(commitment_fr));
+        output_values.push(out.amount);
+        output_blindings.push(blinding);
+        output_pubkeys.push(pubkey);
+    }
+
+    for out_pk in &output_pubkeys {
+        for in_sk in &input_privkeys {
+            if out_pk == in_sk {
+                return Err("output pubkey must not collide with input privkey".to_string());
+            }
+        }
+        for b in input_blindings.iter().chain(output_blindings.iter()) {
+            if out_pk == b {
+                return Err("output pubkey must not collide with blinding".to_string());
+            }
+        }
+    }
+    for in_sk in &input_privkeys {
+        for b in input_blindings.iter().chain(output_blindings.iter()) {
+            if in_sk == b {
+                return Err("input privkey must not collide with blinding".to_string());
+            }
+        }
+    }
+
+    let circuit = TransferCircuitV2::with_witness(
+        root,
+        nullifiers.clone(),
+        output_commitments.clone(),
+        input_values,
+        input_blindings,
+        input_privkeys,
+        input_paths,
+        output_values,
+        output_blindings,
+        output_pubkeys,
+        asset_id,
+    );
+
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+        .map_err(|e| format!("bad proving key: {e}"))?;
+    let proof =
+        Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
+            .map_err(|e| format!("prove failed: {e}"))?;
+
+    let mut proof_bytes = Vec::new();
+    proof
+        .serialize_compressed(&mut proof_bytes)
+        .map_err(|e| format!("serialize failed: {e}"))?;
+
+    let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
+    let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
+    Ok(format!(
+        "{{\"nullifiers\":[\"{}\",\"{}\"],\"output_commitments\":[\"{}\",\"{}\"],\"proof\":\"{}\"}}",
+        nulls[0],
+        nulls[1],
+        commits[0],
+        commits[1],
+        hex::encode(proof_bytes)
+    ))
 }
 
 /// Build a shielded → shielded transfer proof with the spend-key construction
@@ -286,105 +506,29 @@ pub fn prove_transfer_v2(
     inputs_json: &str,
     outputs_json: &str,
 ) -> Result<String, JsValue> {
-    let root = hex32(root_hex)?;
-    let asset_id = hex32(asset_id_hex)?;
-    let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
-
-    let inputs: Vec<TransferInputV2> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
-    let outputs: Vec<TransferOutputV2> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
-    if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str(
-            "transfer requires exactly 2 inputs and 2 outputs",
-        ));
-    }
-
-    let mut nullifiers = Vec::with_capacity(2);
-    let mut input_values = Vec::with_capacity(2);
-    let mut input_blindings = Vec::with_capacity(2);
-    let mut input_privkeys = Vec::with_capacity(2);
-    let mut input_paths = Vec::with_capacity(2);
-    for inp in &inputs {
-        let blinding = hex32(&inp.blinding_hex)?;
-        let privkey = hex32(&inp.privkey_hex)?;
-        let sk = Fr::from_le_bytes_mod_order(&privkey);
-        let commitment_fr = poseidon_commit_spend(
-            Fr::from(inp.amount),
-            poseidon_pubkey(sk),
-            Fr::from_le_bytes_mod_order(&blinding),
-            asset_fr,
-        );
-        let leaf_index = leaf_index_from(&inp.indices);
-        let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
-        let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
-        nullifiers.push(fr_to_le_bytes_32(nullifier_fr));
-        input_values.push(inp.amount);
-        input_blindings.push(blinding);
-        input_privkeys.push(privkey);
-        input_paths.push(merkle_path_from(&inp.path_hex, &inp.indices)?);
-    }
-
-    let mut output_commitments = Vec::with_capacity(2);
-    let mut output_values = Vec::with_capacity(2);
-    let mut output_blindings = Vec::with_capacity(2);
-    let mut output_pubkeys = Vec::with_capacity(2);
-    for out in &outputs {
-        let blinding = hex32(&out.blinding_hex)?;
-        let pubkey = hex32(&out.pubkey_hex)?;
-        let commitment_fr = poseidon_commit_spend(
-            Fr::from(out.amount),
-            Fr::from_le_bytes_mod_order(&pubkey),
-            Fr::from_le_bytes_mod_order(&blinding),
-            asset_fr,
-        );
-        output_commitments.push(fr_to_le_bytes_32(commitment_fr));
-        output_values.push(out.amount);
-        output_blindings.push(blinding);
-        output_pubkeys.push(pubkey);
-    }
-
-    let circuit = TransferCircuitV2::with_witness(
-        root,
-        nullifiers.clone(),
-        output_commitments.clone(),
-        input_values,
-        input_blindings,
-        input_privkeys,
-        input_paths,
-        output_values,
-        output_blindings,
-        output_pubkeys,
-        asset_id,
-    );
-
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
-    let proof =
-        Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
-
-    let mut proof_bytes = Vec::new();
-    proof
-        .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
-
-    let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
-    let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
-    Ok(format!(
-        "{{\"nullifiers\":[\"{}\",\"{}\"],\"output_commitments\":[\"{}\",\"{}\"],\"proof\":\"{}\"}}",
-        nulls[0],
-        nulls[1],
-        commits[0],
-        commits[1],
-        hex::encode(proof_bytes)
-    ))
+    prove_transfer_v2_inner(
+        proving_key,
+        root_hex,
+        asset_id_hex,
+        inputs_json,
+        outputs_json,
+    )
+    .map_err(|e| JsValue::from_str(&e))
 }
 
 // ===== circuit v3 (#350): unified transact =====
 
 use privacy::circuits::{TransactCircuitV3, TX_LEVELS};
 use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature};
+
+/// The v3 empty-tree Merkle root for a depth-32 tree with 0 leaves (`ZERO_HASHES[32]`).
+pub fn v3_empty_tree_root_bytes() -> [u8; 32] {
+    let mut node = Fr::from(0u64);
+    for _ in 0..TX_LEVELS {
+        node = v3_merkle_pair(node, node);
+    }
+    fr_to_le_bytes_32(node)
+}
 
 /// Derive the shielded-asset field element for an SPL `mint` (#779):
 /// `Poseidon(2)` over the mint's two 16-byte little-endian halves. Matches the
@@ -410,17 +554,53 @@ pub fn v3_note_pubkey(privkey_hex: &str) -> Result<String, JsValue> {
 
 /// Derive a v3 note commitment `Poseidon4(amount, pubkey, blinding, asset)`
 /// for the native asset — the exact leaf `deposit_note` appends on-chain.
+pub fn v3_note_commitment_inner(
+    amount: u64,
+    pubkey_hex: &str,
+    blinding_hex: &str,
+) -> Result<String, String> {
+    let pubkey = hex32_inner(pubkey_hex)?;
+    let blinding = hex32_inner(blinding_hex)?;
+    if pubkey == blinding {
+        return Err("pubkey and blinding must not collide".to_string());
+    }
+    let c = v3_commit(
+        Fr::from(amount),
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
+        Fr::from(0u64), // NATIVE_SOL
+    );
+    Ok(hex::encode(fr_to_le_bytes_32(c)))
+}
+
+/// Derive a v3 note commitment `Poseidon4(amount, pubkey, blinding, asset)`
+/// for the native asset — the exact leaf `deposit_note` appends on-chain.
 #[wasm_bindgen]
 pub fn v3_note_commitment(
     amount: u64,
     pubkey_hex: &str,
     blinding_hex: &str,
 ) -> Result<String, JsValue> {
+    v3_note_commitment_inner(amount, pubkey_hex, blinding_hex).map_err(|e| JsValue::from_str(&e))
+}
+
+pub fn v3_note_commitment_asset_inner(
+    amount: u64,
+    pubkey_hex: &str,
+    blinding_hex: &str,
+    asset_id_hex: &str,
+) -> Result<String, String> {
+    let pubkey = hex32_inner(pubkey_hex)?;
+    let blinding = hex32_inner(blinding_hex)?;
+    if pubkey == blinding {
+        return Err("pubkey and blinding must not collide".to_string());
+    }
+    let asset_id = hex32_inner(asset_id_hex)?;
     let c = v3_commit(
         Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from(0u64), // NATIVE_SOL
+        Fr::from_le_bytes_mod_order(&pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
+        Fr::from_le_bytes_mod_order(&asset_id),
     );
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
@@ -436,13 +616,8 @@ pub fn v3_note_commitment_asset(
     blinding_hex: &str,
     asset_id_hex: &str,
 ) -> Result<String, JsValue> {
-    let c = v3_commit(
-        Fr::from(amount),
-        Fr::from_le_bytes_mod_order(&hex32(pubkey_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(blinding_hex)?),
-        Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?),
-    );
-    Ok(hex::encode(fr_to_le_bytes_32(c)))
+    v3_note_commitment_asset_inner(amount, pubkey_hex, blinding_hex, asset_id_hex)
+        .map_err(|e| JsValue::from_str(&e))
 }
 
 /// An input note being spent by `prove_transact`. `path_hex` is the 32-entry
@@ -450,7 +625,7 @@ pub fn v3_note_commitment_asset(
 /// each level comes from the bits of `leaf_index`, so no direction flags are
 /// needed. A padding input has `amount: 0` (membership is skipped in-circuit
 /// for zero-value notes) with any well-formed path, e.g. all-zero siblings.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TransactInputNote {
     amount: u64,
     privkey_hex: String,
@@ -460,30 +635,14 @@ struct TransactInputNote {
 }
 
 /// An output note being created. A value-0 note is a valid "empty" output.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TransactOutputNote {
     amount: u64,
     pubkey_hex: String,
     blinding_hex: String,
 }
 
-/// Build a v3 unified transact proof entirely in the browser.
-///
-/// Fixed 2-in/2-out against the program's **on-chain** incremental tree:
-/// `root_hex` must be a root from the program's root history (the wallet reads
-/// it from the tree account or an event), and `ext_amount` is the signed
-/// external flow — `< 0` withdraws `|ext_amount|` lamports to `recipient`,
-/// `== 0` is a pure shielded transfer (`> 0` is rejected: deposits go through
-/// `deposit_note`, no proof needed). The circuit enforces
-/// `sum(inputs) + ext_amount == sum(outputs)`; `ext_data_hash` is derived here
-/// exactly as the program derives it (SHA-256 over `recipient ‖ ext_amount`),
-/// so the proof binds the payout destination. Spend keys never leave the
-/// browser.
-///
-/// Returns `{ nullifiers: [hex, hex], output_commitments: [hex, hex], proof }`
-/// — with `root`/`ext_amount`/`recipient`, exactly the transact-ingress body.
-#[wasm_bindgen]
-pub fn prove_transact(
+pub fn prove_transact_inner(
     proving_key: &[u8],
     root_hex: &str,
     ext_amount: i64,
@@ -491,48 +650,55 @@ pub fn prove_transact(
     asset_id_hex: &str,
     inputs_json: &str,
     outputs_json: &str,
-) -> Result<String, JsValue> {
+) -> Result<String, String> {
     if ext_amount > 0 {
-        return Err(JsValue::from_str(
-            "positive ext_amount: deposits go through deposit_note, not transact",
-        ));
+        return Err(
+            "positive ext_amount: deposits go through deposit_note, not transact".to_string(),
+        );
     }
-    let root = hex32(root_hex)?;
-    let recipient = hex32(recipient_hex)?;
+    let root = hex32_inner(root_hex)?;
+    if root == [0u8; 32] || root == v3_empty_tree_root_bytes() {
+        return Err("empty-tree root is rejected".to_string());
+    }
+    let recipient = hex32_inner(recipient_hex)?;
 
-    let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
-    let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+    let inputs: Vec<TransactInputNote> =
+        serde_json::from_str(inputs_json).map_err(|e| format!("bad inputs json: {e}"))?;
+    let outputs: Vec<TransactOutputNote> =
+        serde_json::from_str(outputs_json).map_err(|e| format!("bad outputs json: {e}"))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
+        return Err("transact is fixed 2-in/2-out".to_string());
     }
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let asset = Fr::from_le_bytes_mod_order(&hex32_inner(asset_id_hex)?);
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
     let mut in_blindings = Vec::new();
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
+    let mut in_privkeys_raw = Vec::new();
+    let mut in_blindings_raw = Vec::new();
+    let mut in_pubkeys_raw = Vec::new();
     let mut nullifiers = Vec::new();
     for inp in &inputs {
-        let privkey = hex32(&inp.privkey_hex)?;
-        let blinding = hex32(&inp.blinding_hex)?;
+        let privkey = hex32_inner(&inp.privkey_hex)?;
+        let blinding = hex32_inner(&inp.blinding_hex)?;
         if inp.path_hex.len() != TX_LEVELS {
-            return Err(JsValue::from_str(&format!(
+            return Err(format!(
                 "input path must have {TX_LEVELS} siblings, got {}",
                 inp.path_hex.len()
-            )));
+            ));
         }
         let mut path = Vec::with_capacity(TX_LEVELS);
         for sib in &inp.path_hex {
-            path.push(hex32(sib)?);
+            path.push(hex32_inner(sib)?);
         }
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let in_pk = fr_to_le_bytes_32(v3_pubkey(sk));
         let c = v3_commit(
             Fr::from(inp.amount),
             v3_pubkey(sk),
@@ -548,15 +714,21 @@ pub fn prove_transact(
         in_blindings.push(Some(blinding));
         in_leaf_indices.push(Some(inp.leaf_index));
         in_paths.push(Some(path));
+
+        in_privkeys_raw.push(privkey);
+        in_blindings_raw.push(blinding);
+        in_pubkeys_raw.push(in_pk);
     }
 
     let mut out_amounts = Vec::new();
     let mut out_pubkeys = Vec::new();
     let mut out_blindings = Vec::new();
+    let mut out_pubkeys_raw = Vec::new();
+    let mut out_blindings_raw = Vec::new();
     let mut output_commitments = Vec::new();
     for outp in &outputs {
-        let pubkey = hex32(&outp.pubkey_hex)?;
-        let blinding = hex32(&outp.blinding_hex)?;
+        let pubkey = hex32_inner(&outp.pubkey_hex)?;
+        let blinding = hex32_inner(&outp.blinding_hex)?;
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -567,6 +739,52 @@ pub fn prove_transact(
         out_amounts.push(Some(outp.amount));
         out_pubkeys.push(Some(pubkey));
         out_blindings.push(Some(blinding));
+
+        out_pubkeys_raw.push(pubkey);
+        out_blindings_raw.push(blinding);
+    }
+
+    for out_pk in &out_pubkeys_raw {
+        for in_sk in &in_privkeys_raw {
+            if out_pk == in_sk {
+                return Err("output pubkey must not collide with input privkey".to_string());
+            }
+        }
+        for b in in_blindings_raw.iter().chain(out_blindings_raw.iter()) {
+            if out_pk == b {
+                return Err("output pubkey must not collide with blinding".to_string());
+            }
+        }
+    }
+    for in_sk in &in_privkeys_raw {
+        for b in in_blindings_raw.iter().chain(out_blindings_raw.iter()) {
+            if in_sk == b {
+                return Err("input privkey must not collide with blinding".to_string());
+            }
+        }
+    }
+
+    if ext_amount < 0 {
+        for in_sk in &in_privkeys_raw {
+            if &recipient == in_sk {
+                return Err("withdrawal recipient must not collide with input privkey".to_string());
+            }
+        }
+        for in_pk in &in_pubkeys_raw {
+            if &recipient == in_pk {
+                return Err("withdrawal recipient must not collide with spend pubkey".to_string());
+            }
+        }
+        for out_pk in &out_pubkeys_raw {
+            if &recipient == out_pk {
+                return Err("withdrawal recipient must not collide with output pubkey".to_string());
+            }
+        }
+        for b in in_blindings_raw.iter().chain(out_blindings_raw.iter()) {
+            if &recipient == b {
+                return Err("withdrawal recipient must not collide with blinding".to_string());
+            }
+        }
     }
 
     // public_amount = the field encoding of the signed ext_amount (negative =
@@ -603,15 +821,15 @@ pub fn prove_transact(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| format!("bad proving key: {e}"))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| format!("prove failed: {e}"))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| format!("serialize failed: {e}"))?;
 
     // The L2 carries `tag(1) || body`. Nodes split the envelope and reject an
     // unknown suite rather than assuming the one they happen to embed, so an
@@ -631,35 +849,69 @@ pub fn prove_transact(
     ))
 }
 
-/// Rebuild the v3 on-chain tree from its ordered leaf list and return the
-/// membership path for `leaf_index` plus the current root.
+/// Build a v3 unified transact proof entirely in the browser.
 ///
-/// The wallet reconstructs the tree client-side from the program's public
-/// `DepositNoteEvent`/`TransactEvent` logs instead of asking a validator for
-/// its path — asking would leak which leaf is the wallet's. Hashing here (the
-/// same circom Poseidon as the circuit and the on-chain syscall) keeps the
-/// rebuild fast and bit-identical.
+/// Fixed 2-in/2-out against the program's **on-chain** incremental tree:
+/// `root_hex` must be a root from the program's root history (the wallet reads
+/// it from the tree account or an event), and `ext_amount` is the signed
+/// external flow — `< 0` withdraws `|ext_amount|` lamports to `recipient`,
+/// `== 0` is a pure shielded transfer (`> 0` is rejected: deposits go through
+/// `deposit_note`, no proof needed). The circuit enforces
+/// `sum(inputs) + ext_amount == sum(outputs)`; `ext_data_hash` is derived here
+/// exactly as the program derives it (SHA-256 over `recipient ‖ ext_amount`),
+/// so the proof binds the payout destination. Spend keys never leave the
+/// browser.
 ///
-/// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
-/// Returns `{ "path": [hex; 32], "root": hex }`.
+/// Returns `{ nullifiers: [hex, hex], output_commitments: [hex, hex], proof }`
+/// — with `root`/`ext_amount`/`recipient`, exactly the transact-ingress body.
 #[wasm_bindgen]
-pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
+pub fn prove_transact(
+    proving_key: &[u8],
+    root_hex: &str,
+    ext_amount: i64,
+    recipient_hex: &str,
+    asset_id_hex: &str,
+    inputs_json: &str,
+    outputs_json: &str,
+) -> Result<String, JsValue> {
+    prove_transact_inner(
+        proving_key,
+        root_hex,
+        ext_amount,
+        recipient_hex,
+        asset_id_hex,
+        inputs_json,
+        outputs_json,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
+pub fn v3_merkle_path_inner(leaves_json: &str, leaf_index: u32) -> Result<String, String> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
-    let leaves_hex: Vec<String> = serde_json::from_str(leaves_json)
-        .map_err(|e| JsValue::from_str(&format!("bad leaves json: {e}")))?;
+    let leaves_hex: Vec<String> =
+        serde_json::from_str(leaves_json).map_err(|e| format!("bad leaves json: {e}"))?;
     if (leaf_index as usize) >= leaves_hex.len() {
-        return Err(JsValue::from_str("leaf_index out of range"));
+        return Err("leaf_index out of range".to_string());
     }
     let mut level: Vec<Fr> = Vec::with_capacity(leaves_hex.len());
     for l in &leaves_hex {
-        level.push(Fr::from_le_bytes_mod_order(&hex32(l)?));
+        level.push(Fr::from_le_bytes_mod_order(&hex32_inner(l)?));
     }
 
     // Zero-subtree hashes, as the on-chain tree pads with.
     let mut zeros = vec![Fr::from(0u64)];
     for k in 0..TX_LEVELS {
         zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+    }
+
+    for (i, leaf) in level.iter().enumerate() {
+        if zeros.contains(leaf) {
+            return Err(format!(
+                "leaf commitment at index {i} collides with reserved ZERO_HASHES subtree node"
+            ));
+        }
     }
 
     let mut path = Vec::with_capacity(TX_LEVELS);
@@ -688,4 +940,463 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+/// Rebuild the v3 on-chain tree from its ordered leaf list and return the
+/// membership path for `leaf_index` plus the current root.
+///
+/// The wallet reconstructs the tree client-side from the program's public
+/// `DepositNoteEvent`/`TransactEvent` logs instead of asking a validator for
+/// its path — asking would leak which leaf is the wallet's. Hashing here (the
+/// same circom Poseidon as the circuit and the on-chain syscall) keeps the
+/// rebuild fast and bit-identical.
+///
+/// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
+/// Returns `{ "path": [hex; 32], "root": hex }`.
+#[wasm_bindgen]
+pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
+    v3_merkle_path_inner(leaves_json, leaf_index).map_err(|e| JsValue::from_str(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hx(b: &[u8; 32]) -> String {
+        hex::encode(b)
+    }
+
+    #[test]
+    fn test_note_commitment_rejects_randomness_recipient_collision() {
+        let same = hx(&[7u8; 32]);
+        let err = note_commitment_inner(100, &same, &same).unwrap_err();
+        assert!(format!("{err:?}").contains("randomness and recipient must not collide"));
+    }
+
+    #[test]
+    fn test_note_commitment_v2_rejects_privkey_blinding_collision() {
+        let same = hx(&[7u8; 32]);
+        let asset = hx(&[0u8; 32]);
+        let err = note_commitment_v2_inner(100, &same, &same, &asset).unwrap_err();
+        assert!(format!("{err:?}").contains("privkey and blinding must not collide"));
+    }
+
+    #[test]
+    fn test_v3_note_commitment_rejects_pubkey_blinding_collision() {
+        let same = hx(&[7u8; 32]);
+        let err = v3_note_commitment_inner(100, &same, &same).unwrap_err();
+        assert!(format!("{err:?}").contains("pubkey and blinding must not collide"));
+    }
+
+    #[test]
+    fn test_v3_note_commitment_asset_rejects_pubkey_blinding_collision() {
+        let same = hx(&[7u8; 32]);
+        let asset = hx(&[0u8; 32]);
+        let err = v3_note_commitment_asset_inner(100, &same, &same, &asset).unwrap_err();
+        assert!(format!("{err:?}").contains("pubkey and blinding must not collide"));
+    }
+
+    #[test]
+    fn test_prove_withdrawal_v2_rejects_empty_root_and_collisions() {
+        let dummy_pk = vec![0u8; 32];
+        let empty_root = hx(&v2_empty_tree_root_bytes());
+        let valid_root = hx(&[1u8; 32]);
+        let privkey = hx(&[2u8; 32]);
+        let blinding = hx(&[3u8; 32]);
+        let recipient = hx(&[4u8; 32]);
+        let asset = hx(&[0u8; 32]);
+        let path_json = serde_json::to_string(&vec![hx(&[5u8; 32])]).unwrap();
+        let indices_json = serde_json::to_string(&vec![false]).unwrap();
+
+        // Empty-tree root
+        let err = prove_withdrawal_v2_inner(
+            &dummy_pk,
+            &empty_root,
+            100,
+            &blinding,
+            &privkey,
+            &asset,
+            &recipient,
+            &path_json,
+            &indices_json,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("empty-tree root is rejected"));
+
+        // All-zero root
+        let err = prove_withdrawal_v2_inner(
+            &dummy_pk,
+            &hx(&[0u8; 32]),
+            100,
+            &blinding,
+            &privkey,
+            &asset,
+            &recipient,
+            &path_json,
+            &indices_json,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("empty-tree root is rejected"));
+
+        // privkey == blinding
+        let err = prove_withdrawal_v2_inner(
+            &dummy_pk,
+            &valid_root,
+            100,
+            &privkey,
+            &privkey,
+            &asset,
+            &recipient,
+            &path_json,
+            &indices_json,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("privkey and blinding must not collide"));
+
+        // dest_recipient == privkey
+        let err = prove_withdrawal_v2_inner(
+            &dummy_pk,
+            &valid_root,
+            100,
+            &blinding,
+            &privkey,
+            &asset,
+            &privkey,
+            &path_json,
+            &indices_json,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("withdrawal recipient must not collide with spend privkey")
+        );
+
+        // dest_recipient == blinding
+        let err = prove_withdrawal_v2_inner(
+            &dummy_pk,
+            &valid_root,
+            100,
+            &blinding,
+            &privkey,
+            &asset,
+            &blinding,
+            &path_json,
+            &indices_json,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("withdrawal recipient must not collide with blinding"));
+
+        // dest_recipient == in_pubkey
+        let sk = Fr::from_le_bytes_mod_order(&hex32_inner(&privkey).unwrap());
+        let in_pubkey = hx(&fr_to_le_bytes_32(poseidon_pubkey(sk)));
+        let err = prove_withdrawal_v2_inner(
+            &dummy_pk,
+            &valid_root,
+            100,
+            &blinding,
+            &privkey,
+            &asset,
+            &in_pubkey,
+            &path_json,
+            &indices_json,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("withdrawal recipient must not collide with spend pubkey")
+        );
+    }
+
+    #[test]
+    fn test_prove_transfer_v2_rejects_empty_root_and_collisions() {
+        let dummy_pk = vec![0u8; 32];
+        let empty_root = hx(&v2_empty_tree_root_bytes());
+        let valid_root = hx(&[1u8; 32]);
+        let asset = hx(&[0u8; 32]);
+
+        let in0_sk = hx(&[2u8; 32]);
+        let in0_bl = hx(&[3u8; 32]);
+        let in1_sk = hx(&[4u8; 32]);
+        let in1_bl = hx(&[5u8; 32]);
+
+        let out0_pk = hx(&[6u8; 32]);
+        let out0_bl = hx(&[7u8; 32]);
+        let out1_pk = hx(&[8u8; 32]);
+        let out1_bl = hx(&[9u8; 32]);
+
+        let make_inputs = |s0: &str, b0: &str, s1: &str, b1: &str| {
+            format!(
+                r#"[
+                    {{"amount":50,"privkey_hex":"{s0}","blinding_hex":"{b0}","path_hex":["{}"],"indices":[false]}},
+                    {{"amount":50,"privkey_hex":"{s1}","blinding_hex":"{b1}","path_hex":["{}"],"indices":[false]}}
+                ]"#,
+                hx(&[10u8; 32]),
+                hx(&[10u8; 32])
+            )
+        };
+
+        let make_outputs = |p0: &str, b0: &str, p1: &str, b1: &str| {
+            format!(
+                r#"[
+                    {{"amount":50,"pubkey_hex":"{p0}","blinding_hex":"{b0}"}},
+                    {{"amount":50,"pubkey_hex":"{p1}","blinding_hex":"{b1}"}}
+                ]"#
+            )
+        };
+
+        let valid_inputs = make_inputs(&in0_sk, &in0_bl, &in1_sk, &in1_bl);
+        let valid_outputs = make_outputs(&out0_pk, &out0_bl, &out1_pk, &out1_bl);
+
+        // Empty root
+        let err = prove_transfer_v2_inner(
+            &dummy_pk,
+            &empty_root,
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("empty-tree root is rejected"));
+
+        // All-zero root
+        let err = prove_transfer_v2_inner(
+            &dummy_pk,
+            &hx(&[0u8; 32]),
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("empty-tree root is rejected"));
+
+        // out_pubkey == in_privkey (burns note)
+        let bad_outputs_sk_collision = make_outputs(&in0_sk, &out0_bl, &out1_pk, &out1_bl);
+        let err = prove_transfer_v2_inner(
+            &dummy_pk,
+            &valid_root,
+            &asset,
+            &valid_inputs,
+            &bad_outputs_sk_collision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("output pubkey must not collide with input privkey"));
+
+        // out_pubkey == blinding
+        let bad_outputs_bl_collision = make_outputs(&in0_bl, &out0_bl, &out1_pk, &out1_bl);
+        let err = prove_transfer_v2_inner(
+            &dummy_pk,
+            &valid_root,
+            &asset,
+            &valid_inputs,
+            &bad_outputs_bl_collision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("output pubkey must not collide with blinding"));
+
+        // in_privkey == blinding
+        let bad_inputs_bl_collision = make_inputs(&in0_sk, &in0_sk, &in1_sk, &in1_bl);
+        let err = prove_transfer_v2_inner(
+            &dummy_pk,
+            &valid_root,
+            &asset,
+            &bad_inputs_bl_collision,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("input privkey must not collide with blinding"));
+    }
+
+    #[test]
+    fn test_prove_transact_rejects_empty_root_and_collisions() {
+        let dummy_pk = vec![0u8; 32];
+        let empty_root = hx(&v3_empty_tree_root_bytes());
+        let valid_root = hx(&[1u8; 32]);
+        let asset = hx(&[0u8; 32]);
+        let recipient = hx(&[50u8; 32]);
+
+        let in0_sk = hx(&[2u8; 32]);
+        let in0_bl = hx(&[3u8; 32]);
+        let in1_sk = hx(&[4u8; 32]);
+        let in1_bl = hx(&[5u8; 32]);
+
+        let out0_pk = hx(&[6u8; 32]);
+        let out0_bl = hx(&[7u8; 32]);
+        let out1_pk = hx(&[8u8; 32]);
+        let out1_bl = hx(&[9u8; 32]);
+
+        let dummy_path = vec![hx(&[11u8; 32]); TX_LEVELS];
+        let dummy_path_json = serde_json::to_string(&dummy_path).unwrap();
+
+        let make_inputs = |s0: &str, b0: &str, s1: &str, b1: &str| {
+            format!(
+                r#"[
+                    {{"amount":100,"privkey_hex":"{s0}","blinding_hex":"{b0}","leaf_index":0,"path_hex":{dummy_path_json}}},
+                    {{"amount":0,"privkey_hex":"{s1}","blinding_hex":"{b1}","leaf_index":0,"path_hex":{dummy_path_json}}}
+                ]"#
+            )
+        };
+
+        let make_outputs = |p0: &str, b0: &str, p1: &str, b1: &str| {
+            format!(
+                r#"[
+                    {{"amount":50,"pubkey_hex":"{p0}","blinding_hex":"{b0}"}},
+                    {{"amount":0,"pubkey_hex":"{p1}","blinding_hex":"{b1}"}}
+                ]"#
+            )
+        };
+
+        let valid_inputs = make_inputs(&in0_sk, &in0_bl, &in1_sk, &in1_bl);
+        let valid_outputs = make_outputs(&out0_pk, &out0_bl, &out1_pk, &out1_bl);
+
+        // Empty root
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &empty_root,
+            0,
+            &recipient,
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("empty-tree root is rejected"));
+
+        // All-zero root
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &hx(&[0u8; 32]),
+            0,
+            &recipient,
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("empty-tree root is rejected"));
+
+        // out_pubkey == in_privkey
+        let bad_outputs_sk_collision = make_outputs(&in0_sk, &out0_bl, &out1_pk, &out1_bl);
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &valid_root,
+            0,
+            &recipient,
+            &asset,
+            &valid_inputs,
+            &bad_outputs_sk_collision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("output pubkey must not collide with input privkey"));
+
+        // out_pubkey == blinding
+        let bad_outputs_bl_collision = make_outputs(&in0_bl, &out0_bl, &out1_pk, &out1_bl);
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &valid_root,
+            0,
+            &recipient,
+            &asset,
+            &valid_inputs,
+            &bad_outputs_bl_collision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("output pubkey must not collide with blinding"));
+
+        // in_privkey == blinding
+        let bad_inputs_bl_collision = make_inputs(&in0_sk, &in0_sk, &in1_sk, &in1_bl);
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &valid_root,
+            0,
+            &recipient,
+            &asset,
+            &bad_inputs_bl_collision,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("input privkey must not collide with blinding"));
+
+        // Withdrawal recipient == in_privkey
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &valid_root,
+            -50,
+            &in0_sk,
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("withdrawal recipient must not collide with input privkey")
+        );
+
+        // Withdrawal recipient == in_pubkey
+        let in0_sk_fr = Fr::from_le_bytes_mod_order(&hex32_inner(&in0_sk).unwrap());
+        let in0_pk = hx(&fr_to_le_bytes_32(v3_pubkey(in0_sk_fr)));
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &valid_root,
+            -50,
+            &in0_pk,
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("withdrawal recipient must not collide with spend pubkey")
+        );
+
+        // Withdrawal recipient == out_pubkey
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &valid_root,
+            -50,
+            &out0_pk,
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("withdrawal recipient must not collide with output pubkey")
+        );
+
+        // Withdrawal recipient == blinding
+        let err = prove_transact_inner(
+            &dummy_pk,
+            &valid_root,
+            -50,
+            &in0_bl,
+            &asset,
+            &valid_inputs,
+            &valid_outputs,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("withdrawal recipient must not collide with blinding"));
+    }
+
+    #[test]
+    fn test_v3_merkle_path_rejects_reserved_zero_hashes() {
+        use privacy::poseidon_circom::v3_merkle_pair;
+
+        let mut zeros = vec![Fr::from(0u64)];
+        for k in 0..TX_LEVELS {
+            zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+        }
+
+        // Test zeros[0] is rejected
+        let leaves_z0 = serde_json::to_string(&vec![hx(&fr_to_le_bytes_32(zeros[0]))]).unwrap();
+        let err = v3_merkle_path_inner(&leaves_z0, 0).unwrap_err();
+        assert!(format!("{err:?}").contains("collides with reserved ZERO_HASHES"));
+
+        // Test zeros[1] is rejected
+        let leaves_z1 = serde_json::to_string(&vec![hx(&fr_to_le_bytes_32(zeros[1]))]).unwrap();
+        let err = v3_merkle_path_inner(&leaves_z1, 0).unwrap_err();
+        assert!(format!("{err:?}").contains("collides with reserved ZERO_HASHES"));
+
+        // Test zeros[32] is rejected
+        let leaves_z32 = serde_json::to_string(&vec![hx(&fr_to_le_bytes_32(zeros[32]))]).unwrap();
+        let err = v3_merkle_path_inner(&leaves_z32, 0).unwrap_err();
+        assert!(format!("{err:?}").contains("collides with reserved ZERO_HASHES"));
+    }
 }

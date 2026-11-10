@@ -22,9 +22,10 @@ use serde::Deserialize;
 
 use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
 use privacy::poseidon::{
-    poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
-    poseidon_signature,
+    poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier_spend,
+    poseidon_pubkey, poseidon_signature,
 };
+use privacy::poseidon_circom::v3_merkle_pair;
 use sha2::{Digest, Sha256};
 
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
@@ -238,27 +239,219 @@ pub fn prove_withdrawal_v2(
 /// An input note being spent in a transfer. `path_hex`/`indices` are the
 /// root-less Merkle path proving the note's commitment is in the tree, pulled
 /// from the path server.
-#[derive(Deserialize)]
-struct TransferInputV2 {
-    amount: u64,
+#[derive(Deserialize, Clone)]
+pub struct TransferInputV2 {
+    pub amount: u64,
     /// The note's spend key. Authority is knowledge of this, not of a free
     /// secret: it is folded into the nullifier through a signature over
     /// `(commitment, leaf_index)`.
-    privkey_hex: String,
-    blinding_hex: String,
+    pub privkey_hex: String,
+    pub blinding_hex: String,
     /// Root-less Merkle path, sibling per level.
-    path_hex: Vec<String>,
+    pub path_hex: Vec<String>,
     /// Direction bit per level; also gives the leaf index.
-    indices: Vec<bool>,
+    pub indices: Vec<bool>,
 }
 
 /// An output note being created. A value-0 note is a valid "empty" output.
-#[derive(Deserialize)]
-struct TransferOutputV2 {
-    amount: u64,
+#[derive(Deserialize, Clone)]
+pub struct TransferOutputV2 {
+    pub amount: u64,
     /// The recipient's spend *public* key, `Poseidon(privkey)`.
-    pubkey_hex: String,
-    blinding_hex: String,
+    pub pubkey_hex: String,
+    pub blinding_hex: String,
+}
+
+pub fn validate_v2_two_input_merkle_lca(
+    c0: Fr,
+    c1: Fr,
+    i0: u64,
+    i1: u64,
+    path0: &[[u8; 32]],
+    path1: &[[u8; 32]],
+    context: &str,
+) -> Result<(), String> {
+    if path0.len() != path1.len() {
+        return Err(format!("{context}: cross-input path length mismatch"));
+    }
+    let depth = path0.len();
+    if depth == 0 {
+        return Err(format!("{context}: cross-input path cannot be empty"));
+    }
+    if i0 == i1 {
+        return Err(format!(
+            "{context}: cross-input active notes must have distinct leaf indices"
+        ));
+    }
+    let diff = i0 ^ i1;
+    let d_lca = (63 - diff.leading_zeros()) as usize;
+    if d_lca >= depth {
+        return Err(format!(
+            "{context}: cross-input LCA depth {d_lca} exceeds tree depth {depth}"
+        ));
+    }
+
+    let mut node0 = c0;
+    for (d, sib_bytes) in path0.iter().enumerate().take(d_lca) {
+        let sib_fr = Fr::from_le_bytes_mod_order(sib_bytes);
+        node0 = if ((i0 >> d) & 1) == 0 {
+            poseidon_merkle_pair(node0, sib_fr)
+        } else {
+            poseidon_merkle_pair(sib_fr, node0)
+        };
+    }
+
+    let mut node1 = c1;
+    for (d, sib_bytes) in path1.iter().enumerate().take(d_lca) {
+        let sib_fr = Fr::from_le_bytes_mod_order(sib_bytes);
+        node1 = if ((i1 >> d) & 1) == 0 {
+            poseidon_merkle_pair(node1, sib_fr)
+        } else {
+            poseidon_merkle_pair(sib_fr, node1)
+        };
+    }
+
+    if path0[d_lca] != fr_to_le_bytes_32(node1) {
+        return Err(format!(
+            "{context}: cross-input LCA sibling mismatch at level {d_lca}: path_0[{d_lca}] != node_1"
+        ));
+    }
+    if path1[d_lca] != fr_to_le_bytes_32(node0) {
+        return Err(format!(
+            "{context}: cross-input LCA sibling mismatch at level {d_lca}: path_1[{d_lca}] != node_0"
+        ));
+    }
+
+    for d in (d_lca + 1)..depth {
+        if path0[d] != path1[d] {
+            return Err(format!(
+                "{context}: cross-input ancestor sibling mismatch at level {d}: path_0[{d}] != path_1[{d}]"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_v3_two_input_merkle_lca(
+    c0: Fr,
+    c1: Fr,
+    i0: u64,
+    i1: u64,
+    path0: &[[u8; 32]],
+    path1: &[[u8; 32]],
+    context: &str,
+) -> Result<(), String> {
+    if path0.len() != path1.len() {
+        return Err(format!("{context}: cross-input path length mismatch"));
+    }
+    let depth = path0.len();
+    if depth == 0 {
+        return Err(format!("{context}: cross-input path cannot be empty"));
+    }
+    if i0 == i1 {
+        return Err(format!(
+            "{context}: cross-input active notes must have distinct leaf indices"
+        ));
+    }
+    let diff = i0 ^ i1;
+    let d_lca = (63 - diff.leading_zeros()) as usize;
+    if d_lca >= depth {
+        return Err(format!(
+            "{context}: cross-input LCA depth {d_lca} exceeds tree depth {depth}"
+        ));
+    }
+
+    let mut node0 = c0;
+    for (d, sib_bytes) in path0.iter().enumerate().take(d_lca) {
+        let sib_fr = Fr::from_le_bytes_mod_order(sib_bytes);
+        node0 = if ((i0 >> d) & 1) == 0 {
+            v3_merkle_pair(node0, sib_fr)
+        } else {
+            v3_merkle_pair(sib_fr, node0)
+        };
+    }
+
+    let mut node1 = c1;
+    for (d, sib_bytes) in path1.iter().enumerate().take(d_lca) {
+        let sib_fr = Fr::from_le_bytes_mod_order(sib_bytes);
+        node1 = if ((i1 >> d) & 1) == 0 {
+            v3_merkle_pair(node1, sib_fr)
+        } else {
+            v3_merkle_pair(sib_fr, node1)
+        };
+    }
+
+    if path0[d_lca] != fr_to_le_bytes_32(node1) {
+        return Err(format!(
+            "{context}: cross-input LCA sibling mismatch at level {d_lca}: path_0[{d_lca}] != node_1"
+        ));
+    }
+    if path1[d_lca] != fr_to_le_bytes_32(node0) {
+        return Err(format!(
+            "{context}: cross-input LCA sibling mismatch at level {d_lca}: path_1[{d_lca}] != node_0"
+        ));
+    }
+
+    for d in (d_lca + 1)..depth {
+        if path0[d] != path1[d] {
+            return Err(format!(
+                "{context}: cross-input ancestor sibling mismatch at level {d}: path_0[{d}] != path_1[{d}]"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_transfer_v2_slots(
+    inputs: &[TransferInputV2],
+    outputs: &[TransferOutputV2],
+    context: &str,
+) -> Result<(), String> {
+    if inputs.len() != 2 || outputs.len() != 2 {
+        return Err(format!(
+            "{context}: transfer requires exactly 2 inputs and 2 outputs"
+        ));
+    }
+    if inputs[0].amount == 0 || inputs[1].amount == 0 {
+        return Err(format!(
+            "{context}: transfer requires both inputs to have amount > 0"
+        ));
+    }
+    if inputs[0].path_hex.is_empty() || inputs[0].path_hex.len() != inputs[1].path_hex.len() {
+        return Err(format!(
+            "{context}: transfer requires non-empty input paths of equal depth"
+        ));
+    }
+    if outputs[0].amount == 0 {
+        return Err(format!(
+            "{context}: transfer requires outputs[0].amount > 0"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_transact_slots(
+    inputs: &[TransactInputNote],
+    outputs: &[TransactOutputNote],
+    ext_amount: i64,
+    context: &str,
+) -> Result<(), String> {
+    if inputs.len() != 2 || outputs.len() != 2 {
+        return Err(format!("{context}: transact is fixed 2-in/2-out"));
+    }
+    if inputs[0].amount == 0 {
+        return Err(format!(
+            "{context}: transact requires inputs[0].amount > 0 (dummy inputs are placed in inputs[1])"
+        ));
+    }
+    if (ext_amount == 0 || outputs[1].amount > 0) && outputs[0].amount == 0 {
+        return Err(format!(
+            "{context}: transact requires outputs[0].amount > 0 when ext_amount == 0 or outputs[1].amount > 0"
+        ));
+    }
+    Ok(())
 }
 
 /// Build a shielded → shielded transfer proof with the spend-key construction
@@ -294,13 +487,11 @@ pub fn prove_transfer_v2(
         .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransferOutputV2> = serde_json::from_str(outputs_json)
         .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
-    if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str(
-            "transfer requires exactly 2 inputs and 2 outputs",
-        ));
-    }
+    validate_transfer_v2_slots(&inputs, &outputs, "prove_transfer_v2")
+        .map_err(|e| JsValue::from_str(&e))?;
 
     let mut nullifiers = Vec::with_capacity(2);
+    let mut input_commitments = Vec::with_capacity(2);
     let mut input_values = Vec::with_capacity(2);
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
@@ -315,6 +506,7 @@ pub fn prove_transfer_v2(
             Fr::from_le_bytes_mod_order(&blinding),
             asset_fr,
         );
+        input_commitments.push(commitment_fr);
         let leaf_index = leaf_index_from(&inp.indices);
         let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
         let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
@@ -324,6 +516,27 @@ pub fn prove_transfer_v2(
         input_privkeys.push(privkey);
         input_paths.push(merkle_path_from(&inp.path_hex, &inp.indices)?);
     }
+
+    let i0 = leaf_index_from(&inputs[0].indices);
+    let i1 = leaf_index_from(&inputs[1].indices);
+    let mut p0 = Vec::with_capacity(inputs[0].path_hex.len());
+    for s in &inputs[0].path_hex {
+        p0.push(hex32(s)?);
+    }
+    let mut p1 = Vec::with_capacity(inputs[1].path_hex.len());
+    for s in &inputs[1].path_hex {
+        p1.push(hex32(s)?);
+    }
+    validate_v2_two_input_merkle_lca(
+        input_commitments[0],
+        input_commitments[1],
+        i0,
+        i1,
+        &p0,
+        &p1,
+        "prove_transfer_v2",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
 
     let mut output_commitments = Vec::with_capacity(2);
     let mut output_values = Vec::with_capacity(2);
@@ -384,7 +597,7 @@ pub fn prove_transfer_v2(
 // ===== circuit v3 (#350): unified transact =====
 
 use privacy::circuits::{TransactCircuitV3, TX_LEVELS};
-use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature};
+use privacy::poseidon_circom::{v3_commit, v3_nullifier, v3_pubkey, v3_signature};
 
 /// Derive the shielded-asset field element for an SPL `mint` (#779):
 /// `Poseidon(2)` over the mint's two 16-byte little-endian halves. Matches the
@@ -450,21 +663,21 @@ pub fn v3_note_commitment_asset(
 /// each level comes from the bits of `leaf_index`, so no direction flags are
 /// needed. A padding input has `amount: 0` (membership is skipped in-circuit
 /// for zero-value notes) with any well-formed path, e.g. all-zero siblings.
-#[derive(Deserialize)]
-struct TransactInputNote {
-    amount: u64,
-    privkey_hex: String,
-    blinding_hex: String,
-    leaf_index: u64,
-    path_hex: Vec<String>,
+#[derive(Deserialize, Clone)]
+pub struct TransactInputNote {
+    pub amount: u64,
+    pub privkey_hex: String,
+    pub blinding_hex: String,
+    pub leaf_index: u64,
+    pub path_hex: Vec<String>,
 }
 
 /// An output note being created. A value-0 note is a valid "empty" output.
-#[derive(Deserialize)]
-struct TransactOutputNote {
-    amount: u64,
-    pubkey_hex: String,
-    blinding_hex: String,
+#[derive(Deserialize, Clone)]
+pub struct TransactOutputNote {
+    pub amount: u64,
+    pub pubkey_hex: String,
+    pub blinding_hex: String,
 }
 
 /// Build a v3 unified transact proof entirely in the browser.
@@ -504,9 +717,8 @@ pub fn prove_transact(
         .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
     let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
         .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
-    if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
-    }
+    validate_transact_slots(&inputs, &outputs, ext_amount, "prove_transact")
+        .map_err(|e| JsValue::from_str(&e))?;
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
@@ -518,6 +730,7 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
+    let mut input_commitments = Vec::with_capacity(2);
     for inp in &inputs {
         let privkey = hex32(&inp.privkey_hex)?;
         let blinding = hex32(&inp.blinding_hex)?;
@@ -539,6 +752,7 @@ pub fn prove_transact(
             Fr::from_le_bytes_mod_order(&blinding),
             asset,
         );
+        input_commitments.push(c);
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
         nullifiers.push(fr_to_le_bytes_32(nf));
@@ -548,6 +762,21 @@ pub fn prove_transact(
         in_blindings.push(Some(blinding));
         in_leaf_indices.push(Some(inp.leaf_index));
         in_paths.push(Some(path));
+    }
+
+    if inputs[0].amount > 0 && inputs[1].amount > 0 {
+        if let (Some(p0), Some(p1)) = (&in_paths[0], &in_paths[1]) {
+            validate_v3_two_input_merkle_lca(
+                input_commitments[0],
+                input_commitments[1],
+                inputs[0].leaf_index,
+                inputs[1].leaf_index,
+                p0,
+                p1,
+                "prove_transact",
+            )
+            .map_err(|e| JsValue::from_str(&e))?;
+        }
     }
 
     let mut out_amounts = Vec::new();
@@ -643,6 +872,7 @@ pub fn prove_transact(
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
@@ -688,4 +918,262 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slot_ordering_validation() {
+        // Transfer slot ordering
+        let valid_transfer_inputs = vec![
+            TransferInputV2 {
+                amount: 100,
+                privkey_hex: "01".repeat(32),
+                blinding_hex: "02".repeat(32),
+                path_hex: vec!["00".repeat(32); 4],
+                indices: vec![false; 4],
+            },
+            TransferInputV2 {
+                amount: 200,
+                privkey_hex: "03".repeat(32),
+                blinding_hex: "04".repeat(32),
+                path_hex: vec!["00".repeat(32); 4],
+                indices: vec![true; 4],
+            },
+        ];
+        let valid_transfer_outputs = vec![
+            TransferOutputV2 {
+                amount: 250,
+                pubkey_hex: "05".repeat(32),
+                blinding_hex: "06".repeat(32),
+            },
+            TransferOutputV2 {
+                amount: 50,
+                pubkey_hex: "07".repeat(32),
+                blinding_hex: "08".repeat(32),
+            },
+        ];
+
+        // Valid transfer slots pass
+        assert!(validate_transfer_v2_slots(
+            &valid_transfer_inputs,
+            &valid_transfer_outputs,
+            "test"
+        )
+        .is_ok());
+
+        // Zero-amount input 0 rejected
+        let mut zero_inp0 = valid_transfer_inputs.clone();
+        zero_inp0[0].amount = 0;
+        assert!(validate_transfer_v2_slots(&zero_inp0, &valid_transfer_outputs, "test").is_err());
+
+        // Zero-amount input 1 rejected
+        let mut zero_inp1 = valid_transfer_inputs.clone();
+        zero_inp1[1].amount = 0;
+        assert!(validate_transfer_v2_slots(&zero_inp1, &valid_transfer_outputs, "test").is_err());
+
+        // Zero-amount output 0 rejected
+        let mut zero_out0 = valid_transfer_outputs.clone();
+        zero_out0[0].amount = 0;
+        assert!(validate_transfer_v2_slots(&valid_transfer_inputs, &zero_out0, "test").is_err());
+
+        // Transact slot ordering
+        let valid_transact_inputs = vec![
+            TransactInputNote {
+                amount: 1000,
+                privkey_hex: "01".repeat(32),
+                blinding_hex: "02".repeat(32),
+                leaf_index: 0,
+                path_hex: vec!["00".repeat(32); 32],
+            },
+            TransactInputNote {
+                amount: 0,
+                privkey_hex: "03".repeat(32),
+                blinding_hex: "04".repeat(32),
+                leaf_index: 0,
+                path_hex: vec!["00".repeat(32); 32],
+            },
+        ];
+        let valid_transact_outputs = vec![
+            TransactOutputNote {
+                amount: 400,
+                pubkey_hex: "05".repeat(32),
+                blinding_hex: "06".repeat(32),
+            },
+            TransactOutputNote {
+                amount: 100,
+                pubkey_hex: "07".repeat(32),
+                blinding_hex: "08".repeat(32),
+            },
+        ];
+
+        // Valid transact slots pass
+        assert!(validate_transact_slots(
+            &valid_transact_inputs,
+            &valid_transact_outputs,
+            -500,
+            "test"
+        )
+        .is_ok());
+
+        // Inverted dummy input [dummy, active] rejected
+        let mut inverted_inputs = valid_transact_inputs.clone();
+        inverted_inputs[0].amount = 0;
+        inverted_inputs[1].amount = 1000;
+        assert!(
+            validate_transact_slots(&inverted_inputs, &valid_transact_outputs, -500, "test")
+                .is_err()
+        );
+
+        // Inverted [zero, active] outputs in pure transfer (ext_amount == 0) rejected
+        let mut inverted_outputs = valid_transact_outputs.clone();
+        inverted_outputs[0].amount = 0;
+        inverted_outputs[1].amount = 500;
+        assert!(
+            validate_transact_slots(&valid_transact_inputs, &inverted_outputs, 0, "test").is_err()
+        );
+
+        // Inverted [zero, active] outputs in withdrawal rejected when outputs[1].amount > 0
+        assert!(
+            validate_transact_slots(&valid_transact_inputs, &inverted_outputs, -500, "test")
+                .is_err()
+        );
+
+        // Full withdrawal with 0 change ([0, 0] outputs) allowed
+        let mut zero_change_outputs = valid_transact_outputs.clone();
+        zero_change_outputs[0].amount = 0;
+        zero_change_outputs[1].amount = 0;
+        assert!(validate_transact_slots(
+            &valid_transact_inputs,
+            &zero_change_outputs,
+            -1000,
+            "test"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_v3_two_input_merkle_lca_validation() {
+        // Construct a consistent 4-level v3 Merkle tree
+        let c0 = Fr::from(100u64);
+        let c1 = Fr::from(200u64);
+        let c2 = Fr::from(300u64);
+        let c3 = Fr::from(400u64);
+
+        // Level 1:
+        let n01 = v3_merkle_pair(c0, c1);
+        let n23 = v3_merkle_pair(c2, c3);
+        // Level 2:
+        let n0123 = v3_merkle_pair(n01, n23);
+        // Level 3 (root):
+        let dummy_right = Fr::from(999u64);
+        let _root = v3_merkle_pair(n0123, dummy_right);
+
+        // Case A: Adjacent leaves i0 = 0, i1 = 1 (LCA depth = 0)
+        let path0_a = [
+            fr_to_le_bytes_32(c1),
+            fr_to_le_bytes_32(n23),
+            fr_to_le_bytes_32(dummy_right),
+        ];
+        let path1_a = [
+            fr_to_le_bytes_32(c0),
+            fr_to_le_bytes_32(n23),
+            fr_to_le_bytes_32(dummy_right),
+        ];
+        assert!(validate_v3_two_input_merkle_lca(c0, c1, 0, 1, &path0_a, &path1_a, "test").is_ok());
+
+        // Same leaf index rejected
+        assert!(
+            validate_v3_two_input_merkle_lca(c0, c1, 0, 0, &path0_a, &path1_a, "test").is_err()
+        );
+
+        // LCA sibling mismatch at d_lca = 0 rejected
+        let mut bad_lca_path = path0_a;
+        bad_lca_path[0] = fr_to_le_bytes_32(Fr::from(777u64));
+        assert!(
+            validate_v3_two_input_merkle_lca(c0, c1, 0, 1, &bad_lca_path, &path1_a, "test")
+                .is_err()
+        );
+
+        // Above-LCA sibling mismatch at d = 1 rejected
+        let mut bad_ancestor_path = path0_a;
+        bad_ancestor_path[1] = fr_to_le_bytes_32(Fr::from(888u64));
+        assert!(validate_v3_two_input_merkle_lca(
+            c0,
+            c1,
+            0,
+            1,
+            &bad_ancestor_path,
+            &path1_a,
+            "test"
+        )
+        .is_err());
+
+        // Case B: Leaves i0 = 0, i1 = 2 (LCA depth = 1)
+        // For leaf 0: path sibling at d=0 is c1, at d=1 is n23
+        // For leaf 2: path sibling at d=0 is c3, at d=1 is n01
+        let path0_b = [
+            fr_to_le_bytes_32(c1),
+            fr_to_le_bytes_32(n23),
+            fr_to_le_bytes_32(dummy_right),
+        ];
+        let path2_b = [
+            fr_to_le_bytes_32(c3),
+            fr_to_le_bytes_32(n01),
+            fr_to_le_bytes_32(dummy_right),
+        ];
+        assert!(validate_v3_two_input_merkle_lca(c0, c2, 0, 2, &path0_b, &path2_b, "test").is_ok());
+
+        // Tampered folded node at LCA depth 1 rejected
+        let mut bad_lca1_path = path0_b;
+        bad_lca1_path[1] = fr_to_le_bytes_32(Fr::from(555u64));
+        assert!(
+            validate_v3_two_input_merkle_lca(c0, c2, 0, 2, &bad_lca1_path, &path2_b, "test")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_v2_two_input_merkle_lca_validation() {
+        // Construct a consistent 4-level v2 Merkle tree
+        let c0 = Fr::from(100u64);
+        let c1 = Fr::from(200u64);
+        let c2 = Fr::from(300u64);
+        let c3 = Fr::from(400u64);
+
+        let n01 = poseidon_merkle_pair(c0, c1);
+        let n23 = poseidon_merkle_pair(c2, c3);
+        let n0123 = poseidon_merkle_pair(n01, n23);
+        let dummy_right = Fr::from(999u64);
+        let _root = poseidon_merkle_pair(n0123, dummy_right);
+
+        let path0 = [
+            fr_to_le_bytes_32(c1),
+            fr_to_le_bytes_32(n23),
+            fr_to_le_bytes_32(dummy_right),
+        ];
+        let path1 = [
+            fr_to_le_bytes_32(c0),
+            fr_to_le_bytes_32(n23),
+            fr_to_le_bytes_32(dummy_right),
+        ];
+        assert!(validate_v2_two_input_merkle_lca(c0, c1, 0, 1, &path0, &path1, "test").is_ok());
+
+        // Same leaf index rejected
+        assert!(validate_v2_two_input_merkle_lca(c0, c1, 0, 0, &path0, &path1, "test").is_err());
+
+        // LCA mismatch rejected
+        let mut bad_lca = path0;
+        bad_lca[0] = fr_to_le_bytes_32(Fr::from(111u64));
+        assert!(validate_v2_two_input_merkle_lca(c0, c1, 0, 1, &bad_lca, &path1, "test").is_err());
+
+        // Above-LCA mismatch rejected
+        let mut bad_ancestor = path0;
+        bad_ancestor[1] = fr_to_le_bytes_32(Fr::from(222u64));
+        assert!(
+            validate_v2_two_input_merkle_lca(c0, c1, 0, 1, &bad_ancestor, &path1, "test").is_err()
+        );
+    }
 }

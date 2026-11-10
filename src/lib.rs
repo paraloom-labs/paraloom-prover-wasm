@@ -35,14 +35,21 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
-fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+fn hex32_str(s: &str) -> Result<[u8; 32], String> {
+    if s.len() != 64 {
+        return Err("expected 32-byte hex".to_string());
+    }
+    let b = hex::decode(s).map_err(|e| format!("bad hex: {e}"))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err("expected 32-byte hex".to_string());
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
+    hex32_str(s).map_err(|e| JsValue::from_str(&e))
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -106,10 +113,11 @@ pub fn note_commitment_v2(
     Ok(hex::encode(fr_to_le_bytes_32(c)))
 }
 
-fn rng_from_entropy() -> StdRng {
+fn rng_from_entropy() -> Result<StdRng, JsValue> {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("browser entropy");
-    StdRng::from_seed(seed)
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| JsValue::from_str(&format!("entropy failed: {e}")))?;
+    Ok(StdRng::from_seed(seed))
 }
 
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
@@ -219,8 +227,9 @@ pub fn prove_withdrawal_v2(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let mut rng = rng_from_entropy()?;
     let proof =
-        Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
+        Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng)
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
@@ -238,7 +247,8 @@ pub fn prove_withdrawal_v2(
 /// An input note being spent in a transfer. `path_hex`/`indices` are the
 /// root-less Merkle path proving the note's commitment is in the tree, pulled
 /// from the path server.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct TransferInputV2 {
     amount: u64,
     /// The note's spend key. Authority is knowledge of this, not of a free
@@ -253,7 +263,8 @@ struct TransferInputV2 {
 }
 
 /// An output note being created. A value-0 note is a valid "empty" output.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct TransferOutputV2 {
     amount: u64,
     /// The recipient's spend *public* key, `Poseidon(privkey)`.
@@ -360,8 +371,9 @@ pub fn prove_transfer_v2(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let mut rng = rng_from_entropy()?;
     let proof =
-        Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
+        Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng)
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
@@ -450,7 +462,8 @@ pub fn v3_note_commitment_asset(
 /// each level comes from the bits of `leaf_index`, so no direction flags are
 /// needed. A padding input has `amount: 0` (membership is skipped in-circuit
 /// for zero-value notes) with any well-formed path, e.g. all-zero siblings.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct TransactInputNote {
     amount: u64,
     privkey_hex: String,
@@ -460,7 +473,8 @@ struct TransactInputNote {
 }
 
 /// An output note being created. A value-0 note is a valid "empty" output.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct TransactOutputNote {
     amount: u64,
     pubkey_hex: String,
@@ -604,8 +618,9 @@ pub fn prove_transact(
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let mut rng = rng_from_entropy()?;
     let proof =
-        Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
+        Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng)
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
 
     let mut proof_bytes = Vec::new();
@@ -688,4 +703,146 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_std::rand::RngCore;
+
+    #[test]
+    fn test_hex32_valid() {
+        let valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let res = hex32_str(valid);
+        assert!(res.is_ok());
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[31], 0xef);
+    }
+
+    #[test]
+    fn test_hex32_rejects_whitespace_and_invalid_lengths() {
+        let valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Leading space
+        let leading_space = format!(" {valid}");
+        assert!(hex32_str(&leading_space).is_err());
+
+        // Trailing space
+        let trailing_space = format!("{valid} ");
+        assert!(hex32_str(&trailing_space).is_err());
+
+        // Newline
+        let newline = format!("\n{valid}");
+        assert!(hex32_str(&newline).is_err());
+
+        // Tab
+        let tab = format!("{valid}\t");
+        assert!(hex32_str(&tab).is_err());
+
+        // Padded to 64 chars with leading space
+        let mut padded = valid.to_string();
+        padded.pop();
+        let space_padded = format!(" {padded}");
+        assert_eq!(space_padded.len(), 64);
+        assert!(hex32_str(&space_padded).is_err());
+
+        // Non-hex characters
+        let mut non_hex = valid.to_string();
+        non_hex.replace_range(0..2, "zz");
+        assert!(hex32_str(&non_hex).is_err());
+
+        // Invalid lengths
+        assert!(hex32_str("").is_err());
+        assert!(hex32_str("00").is_err());
+        assert!(hex32_str(&valid[..62]).is_err());
+        assert!(hex32_str(&valid[..63]).is_err());
+        let too_long = format!("{valid}00");
+        assert!(hex32_str(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_witness_structs_deny_unknown_fields() {
+        // TransferInputV2
+        let valid_transfer_in = r#"{
+            "amount": 100,
+            "privkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "path_hex": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+            "indices": [false]
+        }"#;
+        assert!(serde_json::from_str::<TransferInputV2>(valid_transfer_in).is_ok());
+
+        let invalid_transfer_in = r#"{
+            "amount": 100,
+            "privkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "path_hex": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+            "indices": [false],
+            "extra_field": "disallowed"
+        }"#;
+        assert!(serde_json::from_str::<TransferInputV2>(invalid_transfer_in).is_err());
+
+        // TransferOutputV2
+        let valid_transfer_out = r#"{
+            "amount": 100,
+            "pubkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }"#;
+        assert!(serde_json::from_str::<TransferOutputV2>(valid_transfer_out).is_ok());
+
+        let invalid_transfer_out = r#"{
+            "amount": 100,
+            "pubkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "unknown": 42
+        }"#;
+        assert!(serde_json::from_str::<TransferOutputV2>(invalid_transfer_out).is_err());
+
+        // TransactInputNote
+        let valid_transact_in = r#"{
+            "amount": 100,
+            "privkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "leaf_index": 0,
+            "path_hex": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+        }"#;
+        assert!(serde_json::from_str::<TransactInputNote>(valid_transact_in).is_ok());
+
+        let invalid_transact_in = r#"{
+            "amount": 100,
+            "privkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "leaf_index": 0,
+            "path_hex": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+            "indices": [true]
+        }"#;
+        assert!(serde_json::from_str::<TransactInputNote>(invalid_transact_in).is_err());
+
+        // TransactOutputNote
+        let valid_transact_out = r#"{
+            "amount": 100,
+            "pubkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }"#;
+        assert!(serde_json::from_str::<TransactOutputNote>(valid_transact_out).is_ok());
+
+        let invalid_transact_out = r#"{
+            "amount": 100,
+            "pubkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blinding_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "unexpected": "error"
+        }"#;
+        assert!(serde_json::from_str::<TransactOutputNote>(invalid_transact_out).is_err());
+    }
+
+    #[test]
+    fn test_rng_from_entropy() {
+        let rng = rng_from_entropy();
+        assert!(rng.is_ok());
+        let mut rng = rng.unwrap();
+        let val1 = rng.next_u64();
+        let val2 = rng.next_u64();
+        assert_ne!(val1, val2);
+    }
 }

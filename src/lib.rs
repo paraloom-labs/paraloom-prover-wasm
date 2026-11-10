@@ -20,11 +20,12 @@ use wasm_bindgen::prelude::*;
 
 use serde::Deserialize;
 
-use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
+use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2, TX_LEVELS};
 use privacy::poseidon::{
     poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
     poseidon_signature,
 };
+use privacy::poseidon_circom::v3_merkle_pair;
 use sha2::{Digest, Sha256};
 
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
@@ -33,6 +34,116 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     let mut o = [0u8; 32];
     o.copy_from_slice(&v[..32]);
     o
+}
+
+const WSOL_NATIVE_MINT_BYTES: [u8; 32] = [
+    6, 155, 136, 87, 254, 171, 129, 132, 251, 104, 127, 99, 70, 24, 192, 53, 218, 196, 57, 220, 26,
+    235, 59, 85, 152, 160, 240, 0, 0, 0, 0, 1,
+];
+const SPL_TOKEN_PROGRAM_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
+    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+];
+const SPL_TOKEN_2022_PROGRAM_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 238, 117, 143, 222, 24, 66, 93, 188, 228, 108, 205, 218, 182, 26, 252, 77,
+    131, 185, 13, 39, 254, 189, 249, 40, 216, 161, 139, 252,
+];
+const ASSOCIATED_TOKEN_PROGRAM_BYTES: [u8; 32] = [
+    140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131, 11, 90, 19, 153, 218,
+    255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+];
+
+fn validate_mint_to_asset_input(mint: &[u8; 32]) -> Result<(), String> {
+    if mint == &[0u8; 32] || mint == &WSOL_NATIVE_MINT_BYTES {
+        return Err(
+            "mint_to_asset: native SOL and WSOL use all-zero NATIVE_SOL_ASSET, not mint_to_asset"
+                .to_string(),
+        );
+    }
+    if mint == &SPL_TOKEN_PROGRAM_BYTES
+        || mint == &SPL_TOKEN_2022_PROGRAM_BYTES
+        || mint == &ASSOCIATED_TOKEN_PROGRAM_BYTES
+    {
+        return Err(
+            "mint_to_asset: mint cannot be a Solana token or associated-token program ID"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_v2_merkle_path_siblings(
+    path: &[([u8; 32], bool)],
+    root: &[u8; 32],
+    commitment: &[u8; 32],
+    context: &str,
+) -> Result<(), String> {
+    for (depth, (sibling, _)) in path.iter().enumerate() {
+        if sibling == root {
+            return Err(format!(
+                "{context}: path sibling at depth {depth} collides with Merkle root"
+            ));
+        }
+        if sibling == commitment {
+            return Err(format!(
+                "{context}: path sibling at depth {depth} collides with input leaf commitment"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v3_merkle_path_topology(
+    path: &[[u8; 32]],
+    leaf_index: u64,
+    amount: u64,
+    root: &[u8; 32],
+    commitment: &[u8; 32],
+) -> Result<(), String> {
+    let mut zeros_fr = vec![Fr::from(0u64)];
+    for k in 0..TX_LEVELS {
+        zeros_fr.push(v3_merkle_pair(zeros_fr[k], zeros_fr[k]));
+    }
+    let zeros_bytes: Vec<[u8; 32]> = zeros_fr.into_iter().map(fr_to_le_bytes_32).collect();
+
+    let mut must_remain_empty_right_frontier = false;
+    for (depth, sibling) in path.iter().enumerate() {
+        if sibling == root {
+            return Err(format!(
+                "prove_transact: path sibling at depth {depth} collides with Merkle root"
+            ));
+        }
+        if amount > 0 && sibling == commitment {
+            return Err(format!(
+                "prove_transact: path sibling at depth {depth} collides with active input commitment"
+            ));
+        }
+        for (k, z) in zeros_bytes.iter().enumerate() {
+            if k != depth && sibling == z {
+                return Err(format!(
+                    "prove_transact: path sibling at depth {depth} equals ZERO_HASHES[{k}] from wrong tree level"
+                ));
+            }
+        }
+        if amount > 0 {
+            let is_right_child = ((leaf_index >> depth) & 1) == 1;
+            let is_zero_hash_at_depth = sibling == &zeros_bytes[depth];
+            if is_right_child && is_zero_hash_at_depth {
+                return Err(format!(
+                    "prove_transact: active input at right-child depth {depth} cannot have empty ZERO_HASHES[{depth}] left sibling"
+                ));
+            }
+            if must_remain_empty_right_frontier && !is_zero_hash_at_depth {
+                return Err(format!(
+                    "prove_transact: active input violates append-only frontier contiguity at depth {depth}"
+                ));
+            }
+            if (leaf_index >> depth) == 0 && is_zero_hash_at_depth {
+                must_remain_empty_right_frontier = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
@@ -194,6 +305,14 @@ pub fn prove_withdrawal_v2(
         Fr::from_le_bytes_mod_order(&blinding),
         Fr::from_le_bytes_mod_order(&asset_id),
     );
+    let commitment_bytes = fr_to_le_bytes_32(commitment_fr);
+    validate_v2_merkle_path_siblings(
+        &merkle_path,
+        &root,
+        &commitment_bytes,
+        "prove_withdrawal_v2",
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
     let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
     let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
     let nullifier = fr_to_le_bytes_32(nullifier_fr);
@@ -315,6 +434,17 @@ pub fn prove_transfer_v2(
             Fr::from_le_bytes_mod_order(&blinding),
             asset_fr,
         );
+        let commitment_bytes = fr_to_le_bytes_32(commitment_fr);
+        let merkle_path = merkle_path_from(&inp.path_hex, &inp.indices)?;
+        if inp.amount > 0 {
+            validate_v2_merkle_path_siblings(
+                &merkle_path,
+                &root,
+                &commitment_bytes,
+                "prove_transfer_v2",
+            )
+            .map_err(|e| JsValue::from_str(&e))?;
+        }
         let leaf_index = leaf_index_from(&inp.indices);
         let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
         let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
@@ -322,7 +452,7 @@ pub fn prove_transfer_v2(
         input_values.push(inp.amount);
         input_blindings.push(blinding);
         input_privkeys.push(privkey);
-        input_paths.push(merkle_path_from(&inp.path_hex, &inp.indices)?);
+        input_paths.push(merkle_path);
     }
 
     let mut output_commitments = Vec::with_capacity(2);
@@ -383,8 +513,8 @@ pub fn prove_transfer_v2(
 
 // ===== circuit v3 (#350): unified transact =====
 
-use privacy::circuits::{TransactCircuitV3, TX_LEVELS};
-use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature};
+use privacy::circuits::TransactCircuitV3;
+use privacy::poseidon_circom::{v3_commit, v3_nullifier, v3_pubkey, v3_signature};
 
 /// Derive the shielded-asset field element for an SPL `mint` (#779):
 /// `Poseidon(2)` over the mint's two 16-byte little-endian halves. Matches the
@@ -396,6 +526,7 @@ use privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_nullifier, v3_pubke
 #[wasm_bindgen]
 pub fn mint_to_asset(mint_hex: &str) -> Result<String, JsValue> {
     let mint = hex32(mint_hex)?;
+    validate_mint_to_asset_input(&mint).map_err(|e| JsValue::from_str(&e))?;
     let lo = Fr::from_le_bytes_mod_order(&mint[..16]);
     let hi = Fr::from_le_bytes_mod_order(&mint[16..]);
     Ok(hex::encode(fr_to_le_bytes_32(v3_merkle_pair(lo, hi))))
@@ -539,6 +670,15 @@ pub fn prove_transact(
             Fr::from_le_bytes_mod_order(&blinding),
             asset,
         );
+        let commitment_bytes = fr_to_le_bytes_32(c);
+        validate_v3_merkle_path_topology(
+            &path,
+            inp.leaf_index,
+            inp.amount,
+            &root,
+            &commitment_bytes,
+        )
+        .map_err(|e| JsValue::from_str(&e))?;
         let sig = v3_signature(sk, c, Fr::from(inp.leaf_index));
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
         nullifiers.push(fr_to_le_bytes_32(nf));
@@ -643,6 +783,7 @@ pub fn prove_transact(
 /// `leaves_json`: JSON array of 32-byte hex leaf commitments in append order.
 /// Returns `{ "path": [hex; 32], "root": hex }`.
 #[wasm_bindgen]
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsValue> {
     use privacy::poseidon_circom::v3_merkle_pair;
 
@@ -688,4 +829,70 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod merkle_topology_and_mint_tests {
+    use super::*;
+
+    #[test]
+    fn validates_v3_merkle_topology_v2_siblings_and_mint_to_asset() {
+        let mut zeros_fr = vec![Fr::from(0u64)];
+        for k in 0..TX_LEVELS {
+            zeros_fr.push(v3_merkle_pair(zeros_fr[k], zeros_fr[k]));
+        }
+        let zeros: Vec<[u8; 32]> = zeros_fr.into_iter().map(fr_to_le_bytes_32).collect();
+        let valid_path: Vec<[u8; 32]> = zeros[..TX_LEVELS].to_vec();
+        let root = [77u8; 32];
+        let commitment = [88u8; 32];
+
+        // Valid leaf 0 path in 1-leaf tree passes
+        assert!(validate_v3_merkle_path_topology(&valid_path, 0, 1000, &root, &commitment).is_ok());
+
+        // All-zero path at depth >= 1 (wrong-level ZERO_HASHES[0]) is rejected
+        let all_zero_path = vec![[0u8; 32]; TX_LEVELS];
+        assert!(
+            validate_v3_merkle_path_topology(&all_zero_path, 0, 1000, &root, &commitment).is_err()
+        );
+
+        // Right child (leaf_index = 1) with empty left sibling ZERO_HASHES[0] at depth 0 is rejected
+        assert!(
+            validate_v3_merkle_path_topology(&valid_path, 1, 1000, &root, &commitment).is_err()
+        );
+
+        // Right-frontier contiguity violation (empty right sibling at depth 0, non-empty at depth 1) is rejected
+        let mut non_contiguous_path = valid_path.clone();
+        non_contiguous_path[1] = [55u8; 32];
+        assert!(validate_v3_merkle_path_topology(
+            &non_contiguous_path,
+            0,
+            1000,
+            &root,
+            &commitment
+        )
+        .is_err());
+
+        // Sibling colliding with root or commitment is rejected in both v3 and v2
+        let mut root_collision_path = valid_path.clone();
+        root_collision_path[0] = root;
+        assert!(validate_v3_merkle_path_topology(
+            &root_collision_path,
+            0,
+            1000,
+            &root,
+            &commitment
+        )
+        .is_err());
+        assert!(
+            validate_v2_merkle_path_siblings(&[(commitment, true)], &root, &commitment, "v2")
+                .is_err()
+        );
+
+        // mint_to_asset rejects WSOL_MINT and Solana token program IDs
+        assert!(validate_mint_to_asset_input(&WSOL_NATIVE_MINT_BYTES).is_err());
+        assert!(validate_mint_to_asset_input(&SPL_TOKEN_PROGRAM_BYTES).is_err());
+        assert!(validate_mint_to_asset_input(&SPL_TOKEN_2022_PROGRAM_BYTES).is_err());
+        assert!(validate_mint_to_asset_input(&ASSOCIATED_TOKEN_PROGRAM_BYTES).is_err());
+        assert!(validate_mint_to_asset_input(&[42u8; 32]).is_ok());
+    }
 }

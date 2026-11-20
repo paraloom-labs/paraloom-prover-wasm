@@ -217,8 +217,12 @@ pub fn prove_withdrawal_v2(
         input_path: Some(merkle_path),
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+    let mut cursor = &proving_key[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    if !cursor.is_empty() {
+        return Err(JsValue::from_str("bad proving key: trailing bytes"));
+    }
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -358,8 +362,12 @@ pub fn prove_transfer_v2(
         asset_id,
     );
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+    let mut cursor = &proving_key[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    if !cursor.is_empty() {
+        return Err(JsValue::from_str("bad proving key: trailing bytes"));
+    }
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -602,8 +610,12 @@ pub fn prove_transact(
         out_blindings,
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
+    let mut cursor = &proving_key[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    if !cursor.is_empty() {
+        return Err(JsValue::from_str("bad proving key: trailing bytes"));
+    }
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;

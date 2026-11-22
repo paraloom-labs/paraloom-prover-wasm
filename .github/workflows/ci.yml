@@ -1,0 +1,17 @@
+# Minimal CI (#1647): run `cargo test` so the test suite cannot silently rot
+# again. The proving smoke tests skip gracefully when the gitignored
+# ceremony keys are absent, but compiling the test target is itself the
+# regression guard — a broken call site fails the build before any test runs.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked

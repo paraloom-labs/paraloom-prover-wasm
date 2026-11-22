@@ -9,9 +9,17 @@ use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalDeserialize;
 
-use paraloom_prover_wasm::{prove_transact, v3_note_commitment, v3_note_pubkey};
+use paraloom_prover_wasm::{
+    mint_to_asset, prove_transact, v3_note_commitment, v3_note_commitment_asset,
+    v3_note_pubkey,
+};
 
 const KEYS_DIR: &str = "../paraloom-core/keys";
+
+/// The native-SOL asset id: all-zero (#779). Every note in one transact
+/// shares one asset, so the existing fixtures prove under this id.
+const NATIVE_ASSET_ID_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn fr_to_le(f: &Fr) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -111,6 +119,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
         &hx(&fr_to_le(&root)),
         -500,
         &hx(&recipient),
+        NATIVE_ASSET_ID_HEX,
         &inputs,
         &outputs,
     )
@@ -123,7 +132,7 @@ fn prove_transact_roundtrips_against_the_persistent_keys() {
     // check it, so the test also pins that `prove_transact` tags with the v3
     // suite. This is what the earlier version got wrong: it deserialized the
     // tagged bytes directly, which fails on the leading tag byte, and the test
-    // never ran in CI (prover-wasm has no workflow) so nothing caught it.
+    // never ran in CI before #1647 added a workflow, so nothing caught it.
     let wire = hex::decode(v["proof"].as_str().unwrap()).unwrap();
     let (suite, proof_bytes) =
         paraloom_prover_wasm::privacy::proof_codec::split_tagged_proof(&wire)
@@ -246,6 +255,7 @@ fn v3_merkle_path_output_proves_membership() {
         &root_hex,
         -500,
         &hx(&[3u8; 32]),
+        NATIVE_ASSET_ID_HEX,
         &inputs,
         &outputs,
     );
@@ -253,5 +263,168 @@ fn v3_merkle_path_output_proves_membership() {
         res.is_ok(),
         "a v3_merkle_path path must prove membership: {:?}",
         res.err()
+    );
+}
+
+/// The same round-trip as `prove_transact_roundtrips_against_the_persistent_keys`
+/// but for a shielded SPL note: the asset id is the non-zero id derived from
+/// a dummy mint via `mint_to_asset` (#779), and it must flow into the input
+/// note commitment, the output commitments, and the asset public input —
+/// proving the `asset_id_hex` wiring the first test never exercised (#1647).
+#[test]
+fn prove_transact_roundtrips_with_nonzero_spl_asset_id() {
+    let pk_bytes = match std::fs::read(format!("{KEYS_DIR}/transact_v3_proving.key")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("persistent keys not present; skipping");
+            return;
+        }
+    };
+    let vk_bytes =
+        std::fs::read(format!("{KEYS_DIR}/transact_v3_verifying.key")).expect("verifying key");
+
+    if !key_is_circom_convention(&pk_bytes) {
+        eprintln!(
+            "keys/ holds a pre-ceremony arkworks-native key; skipping. \
+             Regenerate from the ceremony zkey to exercise this."
+        );
+        return;
+    }
+
+    // A fixed dummy mint; its derived asset id is non-zero by construction.
+    let mint_hex = hx(&[9u8; 32]);
+    let asset_id_hex = mint_to_asset(&mint_hex).expect("mint_to_asset");
+    let asset_bytes: [u8; 32] = hex::decode(&asset_id_hex).unwrap().try_into().unwrap();
+    let asset_fr = Fr::from_le_bytes_mod_order(&asset_bytes);
+    assert_ne!(asset_fr, Fr::from(0u64), "fixture asset id must be non-zero");
+
+    use paraloom_prover_wasm::privacy::poseidon_circom::{v3_commit, v3_merkle_pair, v3_pubkey};
+    let mut zeros = vec![Fr::from(0u64)];
+    for k in 0..32 {
+        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+    }
+
+    let sk0 = Fr::from(51u64);
+    let bl0 = Fr::from(5u64);
+    // The input note commitment binds the SPL asset, not native SOL.
+    let c0 = v3_commit(Fr::from(1000u64), v3_pubkey(sk0), bl0, asset_fr);
+    let mut root = c0;
+    for z in zeros.iter().take(32) {
+        root = v3_merkle_pair(root, *z);
+    }
+
+    let path_hex: Vec<String> = zeros[..32].iter().map(|z| hx(&fr_to_le(z))).collect();
+    let path_json = serde_json::to_string(&path_hex).unwrap();
+
+    let inputs = format!(
+        r#"[
+          {{"amount":1000,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}},
+          {{"amount":0,"privkey_hex":"{}","blinding_hex":"{}","leaf_index":0,"path_hex":{path_json}}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(51u64))),
+        hx(&fr_to_le(&Fr::from(5u64))),
+        hx(&fr_to_le(&Fr::from(52u64))),
+        hx(&fr_to_le(&Fr::from(6u64))),
+    );
+    let opk0 = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(61u64)))).unwrap();
+    let opk1 = v3_note_pubkey(&hx(&fr_to_le(&Fr::from(62u64)))).unwrap();
+    let outputs = format!(
+        r#"[
+          {{"amount":400,"pubkey_hex":"{opk0}","blinding_hex":"{}"}},
+          {{"amount":100,"pubkey_hex":"{opk1}","blinding_hex":"{}"}}
+        ]"#,
+        hx(&fr_to_le(&Fr::from(1u64))),
+        hx(&fr_to_le(&Fr::from(2u64))),
+    );
+
+    let recipient = [3u8; 32];
+    let out = prove_transact(
+        &pk_bytes,
+        &hx(&fr_to_le(&root)),
+        -500,
+        &hx(&recipient),
+        &asset_id_hex,
+        &inputs,
+        &outputs,
+    )
+    .expect("prove_transact");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json out");
+    let wire = hex::decode(v["proof"].as_str().unwrap()).unwrap();
+    let (suite, proof_bytes) =
+        paraloom_prover_wasm::privacy::proof_codec::split_tagged_proof(&wire)
+            .expect("proof carries a valid suite tag");
+    assert_eq!(
+        suite,
+        paraloom_prover_wasm::privacy::proof_codec::ProofSuite::Groth16Bn254TransactV3
+    );
+
+    // Output commitments must equal the wallet-side derivations for this asset.
+    let oc0: [u8; 32] = hex::decode(v["output_commitments"][0].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let oc1: [u8; 32] = hex::decode(v["output_commitments"][1].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        hex::encode(oc0),
+        v3_note_commitment_asset(
+            400,
+            &opk0,
+            &hx(&fr_to_le(&Fr::from(1u64))),
+            &asset_id_hex
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        hex::encode(oc1),
+        v3_note_commitment_asset(
+            100,
+            &opk1,
+            &hx(&fr_to_le(&Fr::from(2u64))),
+            &asset_id_hex
+        )
+        .unwrap()
+    );
+
+    // Verify against the persistent VK with the SPL asset as public input 3 —
+    // the same check the on-chain verifier performs.
+    let nf0: [u8; 32] = hex::decode(v["nullifiers"][0].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let nf1: [u8; 32] = hex::decode(v["nullifiers"][1].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let vk = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+    let proof = ark_groth16::Proof::<Bn254>::deserialize_compressed(proof_bytes).unwrap();
+
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, recipient);
+    sha2::Digest::update(&mut hasher, (-500i64).to_le_bytes());
+    let ext_data_hash: [u8; 32] = sha2::Digest::finalize(hasher).into();
+
+    let public_inputs = vec![
+        root,
+        -Fr::from(500u64),
+        Fr::from_le_bytes_mod_order(&ext_data_hash),
+        asset_fr,
+        Fr::from_le_bytes_mod_order(&nf0),
+        Fr::from_le_bytes_mod_order(&nf1),
+        Fr::from_le_bytes_mod_order(&oc0),
+        Fr::from_le_bytes_mod_order(&oc1),
+    ];
+    let ok = ark_groth16::Groth16::<Bn254>::verify_proof(
+        &ark_groth16::prepare_verifying_key(&vk),
+        &proof,
+        &public_inputs,
+    )
+    .expect("verify");
+    assert!(
+        ok,
+        "SPL-asset browser-path proof must verify against the persistent VK"
     );
 }

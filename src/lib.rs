@@ -22,8 +22,8 @@ use serde::Deserialize;
 
 use privacy::circuits::{Groth16ProofSystem, TransferCircuitV2, WithdrawCircuitV2};
 use privacy::poseidon::{
-    poseidon_commit, poseidon_commit_spend, poseidon_nullifier_spend, poseidon_pubkey,
-    poseidon_signature,
+    poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier_spend,
+    poseidon_pubkey, poseidon_signature,
 };
 use sha2::{Digest, Sha256};
 
@@ -35,14 +35,18 @@ fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
     o
 }
 
-fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
-    let b = hex::decode(s.trim()).map_err(|e| JsValue::from_str(&format!("bad hex: {e}")))?;
+fn hex32_native(s: &str) -> Result<[u8; 32], String> {
+    let b = hex::decode(s.trim()).map_err(|e| format!("bad hex: {e}"))?;
     if b.len() != 32 {
-        return Err(JsValue::from_str("expected 32-byte hex"));
+        return Err("expected 32-byte hex".to_string());
     }
     let mut o = [0u8; 32];
     o.copy_from_slice(&b);
     Ok(o)
+}
+
+fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
+    hex32_native(s).map_err(|e| JsValue::from_str(&e))
 }
 
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
@@ -113,18 +117,25 @@ fn rng_from_entropy() -> StdRng {
 }
 
 /// Build a `(sibling, is_left)` Merkle path from parallel hex/bool arrays.
+fn merkle_path_from_native(
+    path_hex: &[String],
+    indices: &[bool],
+) -> Result<Vec<([u8; 32], bool)>, String> {
+    if path_hex.len() != indices.len() {
+        return Err("path and indices length mismatch".to_string());
+    }
+    let mut path = Vec::with_capacity(path_hex.len());
+    for (h, dir) in path_hex.iter().zip(indices) {
+        path.push((hex32_native(h)?, *dir));
+    }
+    Ok(path)
+}
+
 fn merkle_path_from(
     path_hex: &[String],
     indices: &[bool],
 ) -> Result<Vec<([u8; 32], bool)>, JsValue> {
-    if path_hex.len() != indices.len() {
-        return Err(JsValue::from_str("path and indices length mismatch"));
-    }
-    let mut path = Vec::with_capacity(path_hex.len());
-    for (h, dir) in path_hex.iter().zip(indices) {
-        path.push((hex32(h)?, *dir));
-    }
-    Ok(path)
+    merkle_path_from_native(path_hex, indices).map_err(|e| JsValue::from_str(&e))
 }
 
 /// Leaf index from a path's direction bits: a level adds `2^level` when the
@@ -139,6 +150,76 @@ fn leaf_index_from(indices: &[bool]) -> u64 {
         }
     }
     idx
+}
+
+/// Fold a v2 Merkle path from leaf commitment to root, recording intermediate nodes.
+fn fold_v2_path(
+    commitment: Fr,
+    path: &[([u8; 32], bool)],
+) -> (Vec<Fr>, Fr) {
+    let mut nodes = Vec::with_capacity(path.len() + 1);
+    let mut current = commitment;
+    nodes.push(current);
+    for (sib_bytes, is_left) in path {
+        let sib = Fr::from_le_bytes_mod_order(sib_bytes);
+        current = if *is_left {
+            poseidon_merkle_pair(current, sib)
+        } else {
+            poseidon_merkle_pair(sib, current)
+        };
+        nodes.push(current);
+    }
+    (nodes, current)
+}
+
+/// Enforce cross-input Merkle LCA and ancestor consistency for 2-note spends in v2.
+fn validate_v2_2note_merkle_consistency(
+    idx0: u64,
+    idx1: u64,
+    path0: &[([u8; 32], bool)],
+    path1: &[([u8; 32], bool)],
+    nodes0: &[Fr],
+    nodes1: &[Fr],
+) -> Result<(), String> {
+    let depth0 = path0.len();
+    let depth1 = path1.len();
+    if depth0 != depth1 {
+        return Err(
+            "cross-input Merkle consistency error: tree depth mismatch on 2-note spend".to_string(),
+        );
+    }
+    if idx0 == idx1 {
+        return Err(format!(
+            "cross-input Merkle consistency error: duplicate leaf index {idx0} on 2-note spend"
+        ));
+    }
+    let diff = idx0 ^ idx1;
+    let lca_level = 63 - diff.leading_zeros() as usize;
+    if lca_level >= depth0 {
+        return Err(
+            "cross-input Merkle consistency error: LCA level exceeds tree depth".to_string(),
+        );
+    }
+
+    // At the LCA level, each input's sibling must equal the other input's intermediate node.
+    let sib0_lca = Fr::from_le_bytes_mod_order(&path0[lca_level].0);
+    let sib1_lca = Fr::from_le_bytes_mod_order(&path1[lca_level].0);
+    if sib0_lca != nodes1[lca_level] || sib1_lca != nodes0[lca_level] {
+        return Err(format!(
+            "cross-input Merkle LCA consistency mismatch at level {lca_level}"
+        ));
+    }
+
+    // For all levels strictly above the LCA, both paths must share identical siblings and direction flags.
+    for m in (lca_level + 1)..depth0 {
+        if path0[m].0 != path1[m].0 || path0[m].1 != path1[m].1 {
+            return Err(format!(
+                "cross-input Merkle ancestor consistency mismatch at level {m}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Prove a spend-key withdrawal (circuit v2, #293).
@@ -278,26 +359,46 @@ struct TransferOutputV2 {
 /// - `outputs_json`: JSON array of 2 output notes
 ///
 /// Returns `{ nullifiers, output_commitments, proof }` (hex).
-#[wasm_bindgen]
-pub fn prove_transfer_v2(
+pub fn prove_transfer_v2_native(
     proving_key: &[u8],
     root_hex: &str,
     asset_id_hex: &str,
     inputs_json: &str,
     outputs_json: &str,
-) -> Result<String, JsValue> {
-    let root = hex32(root_hex)?;
-    let asset_id = hex32(asset_id_hex)?;
+) -> Result<String, String> {
+    let root = hex32_native(root_hex)?;
+    let root_fr = Fr::from_le_bytes_mod_order(&root);
+    let asset_id = hex32_native(asset_id_hex)?;
     let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
 
     let inputs: Vec<TransferInputV2> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
+        .map_err(|e| format!("bad inputs json: {e}"))?;
     let outputs: Vec<TransferOutputV2> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+        .map_err(|e| format!("bad outputs json: {e}"))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str(
-            "transfer requires exactly 2 inputs and 2 outputs",
-        ));
+        return Err("transfer requires exactly 2 inputs and 2 outputs".to_string());
+    }
+
+    // A dummy note (amount == 0) must never precede a real note (amount > 0).
+    if inputs[0].amount == 0 && inputs[1].amount > 0 {
+        return Err(
+            "inverted dummy-input slot ordering: dummy input must follow real input".to_string(),
+        );
+    }
+    if outputs[0].amount == 0 && outputs[1].amount > 0 {
+        return Err(
+            "inverted dummy-output slot ordering: dummy output must follow real output".to_string(),
+        );
+    }
+
+    if inputs[0].amount > 0 && inputs[1].amount > 0 {
+        let idx0 = leaf_index_from(&inputs[0].indices);
+        let idx1 = leaf_index_from(&inputs[1].indices);
+        if idx0 == idx1 {
+            return Err(format!(
+                "cross-input Merkle consistency error: duplicate leaf index {idx0} on 2-note spend"
+            ));
+        }
     }
 
     let mut nullifiers = Vec::with_capacity(2);
@@ -305,9 +406,12 @@ pub fn prove_transfer_v2(
     let mut input_blindings = Vec::with_capacity(2);
     let mut input_privkeys = Vec::with_capacity(2);
     let mut input_paths = Vec::with_capacity(2);
-    for inp in &inputs {
-        let blinding = hex32(&inp.blinding_hex)?;
-        let privkey = hex32(&inp.privkey_hex)?;
+    let mut all_nodes = Vec::with_capacity(2);
+    let mut leaf_indices = Vec::with_capacity(2);
+
+    for (i, inp) in inputs.iter().enumerate() {
+        let blinding = hex32_native(&inp.blinding_hex)?;
+        let privkey = hex32_native(&inp.privkey_hex)?;
         let sk = Fr::from_le_bytes_mod_order(&privkey);
         let commitment_fr = poseidon_commit_spend(
             Fr::from(inp.amount),
@@ -318,11 +422,34 @@ pub fn prove_transfer_v2(
         let leaf_index = leaf_index_from(&inp.indices);
         let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
         let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
+        let merkle_path = merkle_path_from_native(&inp.path_hex, &inp.indices)?;
+
+        let (nodes, computed_root) = fold_v2_path(commitment_fr, &merkle_path);
+        if computed_root != root_fr {
+            return Err(format!(
+                "input {i} Merkle path does not fold to expected root"
+            ));
+        }
+
         nullifiers.push(fr_to_le_bytes_32(nullifier_fr));
         input_values.push(inp.amount);
         input_blindings.push(blinding);
         input_privkeys.push(privkey);
-        input_paths.push(merkle_path_from(&inp.path_hex, &inp.indices)?);
+        input_paths.push(merkle_path);
+        all_nodes.push(nodes);
+        leaf_indices.push(leaf_index);
+    }
+
+    // 2-note spend consistency: both inputs have non-zero value
+    if inputs[0].amount > 0 && inputs[1].amount > 0 {
+        validate_v2_2note_merkle_consistency(
+            leaf_indices[0],
+            leaf_indices[1],
+            &input_paths[0],
+            &input_paths[1],
+            &all_nodes[0],
+            &all_nodes[1],
+        )?;
     }
 
     let mut output_commitments = Vec::with_capacity(2);
@@ -330,8 +457,8 @@ pub fn prove_transfer_v2(
     let mut output_blindings = Vec::with_capacity(2);
     let mut output_pubkeys = Vec::with_capacity(2);
     for out in &outputs {
-        let blinding = hex32(&out.blinding_hex)?;
-        let pubkey = hex32(&out.pubkey_hex)?;
+        let blinding = hex32_native(&out.blinding_hex)?;
+        let pubkey = hex32_native(&out.pubkey_hex)?;
         let commitment_fr = poseidon_commit_spend(
             Fr::from(out.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -359,15 +486,15 @@ pub fn prove_transfer_v2(
     );
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| format!("bad proving key: {e}"))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| format!("prove failed: {e}"))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| format!("serialize failed: {e}"))?;
 
     let nulls: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     let commits: Vec<String> = output_commitments.iter().map(hex::encode).collect();
@@ -379,6 +506,18 @@ pub fn prove_transfer_v2(
         commits[1],
         hex::encode(proof_bytes)
     ))
+}
+
+#[wasm_bindgen]
+pub fn prove_transfer_v2(
+    proving_key: &[u8],
+    root_hex: &str,
+    asset_id_hex: &str,
+    inputs_json: &str,
+    outputs_json: &str,
+) -> Result<String, JsValue> {
+    prove_transfer_v2_native(proving_key, root_hex, asset_id_hex, inputs_json, outputs_json)
+        .map_err(|e| JsValue::from_str(&e))
 }
 
 // ===== circuit v3 (#350): unified transact =====
@@ -467,6 +606,71 @@ struct TransactOutputNote {
     blinding_hex: String,
 }
 
+/// Fold a v3 circom-Poseidon Merkle path from leaf commitment to root, recording intermediate nodes.
+fn fold_v3_path(
+    commitment: Fr,
+    leaf_index: u64,
+    path: &[[u8; 32]],
+) -> (Vec<Fr>, Fr) {
+    let mut nodes = Vec::with_capacity(path.len() + 1);
+    let mut current = commitment;
+    nodes.push(current);
+    for (d, sib_bytes) in path.iter().enumerate() {
+        let sib = Fr::from_le_bytes_mod_order(sib_bytes);
+        let bit = (leaf_index >> d) & 1;
+        current = if bit == 0 {
+            v3_merkle_pair(current, sib)
+        } else {
+            v3_merkle_pair(sib, current)
+        };
+        nodes.push(current);
+    }
+    (nodes, current)
+}
+
+/// Enforce cross-input Merkle LCA and ancestor consistency for 2-note spends in v3.
+fn validate_v3_2note_merkle_consistency(
+    idx0: u64,
+    idx1: u64,
+    path0: &[[u8; 32]],
+    path1: &[[u8; 32]],
+    nodes0: &[Fr],
+    nodes1: &[Fr],
+) -> Result<(), String> {
+    if idx0 == idx1 {
+        return Err(format!(
+            "cross-input Merkle consistency error: duplicate leaf index {idx0} on 2-note spend"
+        ));
+    }
+    let diff = idx0 ^ idx1;
+    let lca_level = 63 - diff.leading_zeros() as usize;
+    if lca_level >= TX_LEVELS {
+        return Err(
+            "cross-input Merkle consistency error: LCA level exceeds tree depth".to_string(),
+        );
+    }
+
+    // At the LCA level, each input's sibling must equal the other input's intermediate node.
+    let sib0_lca = Fr::from_le_bytes_mod_order(&path0[lca_level]);
+    let sib1_lca = Fr::from_le_bytes_mod_order(&path1[lca_level]);
+    if sib0_lca != nodes1[lca_level] || sib1_lca != nodes0[lca_level] {
+        return Err(format!(
+            "cross-input Merkle LCA consistency mismatch at level {lca_level}"
+        ));
+    }
+
+    // For all levels strictly above the LCA, both paths must share identical siblings.
+    for m in (lca_level + 1)..TX_LEVELS {
+        if path0[m] != path1[m] {
+            return Err(format!(
+                "cross-input Merkle ancestor consistency mismatch at level {m}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Build a v3 unified transact proof entirely in the browser.
 ///
 /// Fixed 2-in/2-out against the program's **on-chain** incremental tree:
@@ -482,8 +686,7 @@ struct TransactOutputNote {
 ///
 /// Returns `{ nullifiers: [hex, hex], output_commitments: [hex, hex], proof }`
 /// — with `root`/`ext_amount`/`recipient`, exactly the transact-ingress body.
-#[wasm_bindgen]
-pub fn prove_transact(
+pub fn prove_transact_native(
     proving_key: &[u8],
     root_hex: &str,
     ext_amount: i64,
@@ -491,26 +694,46 @@ pub fn prove_transact(
     asset_id_hex: &str,
     inputs_json: &str,
     outputs_json: &str,
-) -> Result<String, JsValue> {
+) -> Result<String, String> {
     if ext_amount > 0 {
-        return Err(JsValue::from_str(
-            "positive ext_amount: deposits go through deposit_note, not transact",
-        ));
+        return Err(
+            "positive ext_amount: deposits go through deposit_note, not transact".to_string(),
+        );
     }
-    let root = hex32(root_hex)?;
-    let recipient = hex32(recipient_hex)?;
+    let root = hex32_native(root_hex)?;
+    let root_fr = Fr::from_le_bytes_mod_order(&root);
+    let recipient = hex32_native(recipient_hex)?;
 
     let inputs: Vec<TransactInputNote> = serde_json::from_str(inputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad inputs json: {e}")))?;
+        .map_err(|e| format!("bad inputs json: {e}"))?;
     let outputs: Vec<TransactOutputNote> = serde_json::from_str(outputs_json)
-        .map_err(|e| JsValue::from_str(&format!("bad outputs json: {e}")))?;
+        .map_err(|e| format!("bad outputs json: {e}"))?;
     if inputs.len() != 2 || outputs.len() != 2 {
-        return Err(JsValue::from_str("transact is fixed 2-in/2-out"));
+        return Err("transact is fixed 2-in/2-out".to_string());
+    }
+
+    // Enforce canonical dummy slot ordering: dummy notes (amount == 0) must follow real notes.
+    if inputs[0].amount == 0 && inputs[1].amount > 0 {
+        return Err(
+            "inverted dummy-input slot ordering: dummy input must follow real input".to_string(),
+        );
+    }
+    if outputs[0].amount == 0 && outputs[1].amount > 0 {
+        return Err(
+            "inverted dummy-output slot ordering: dummy output must follow real output".to_string(),
+        );
+    }
+
+    if inputs[0].amount > 0 && inputs[1].amount > 0 && inputs[0].leaf_index == inputs[1].leaf_index {
+        return Err(format!(
+            "cross-input Merkle consistency error: duplicate leaf index {} on 2-note spend",
+            inputs[0].leaf_index
+        ));
     }
 
     // The shielded asset: all-zero for native SOL, or `mint_to_asset(mint)` for
     // a shielded SPL note (#779). All notes in one transact share one asset.
-    let asset = Fr::from_le_bytes_mod_order(&hex32(asset_id_hex)?);
+    let asset = Fr::from_le_bytes_mod_order(&hex32_native(asset_id_hex)?);
 
     let mut in_amounts = Vec::new();
     let mut in_privkeys = Vec::new();
@@ -518,18 +741,21 @@ pub fn prove_transact(
     let mut in_leaf_indices = Vec::new();
     let mut in_paths = Vec::new();
     let mut nullifiers = Vec::new();
-    for inp in &inputs {
-        let privkey = hex32(&inp.privkey_hex)?;
-        let blinding = hex32(&inp.blinding_hex)?;
+    let mut all_paths_raw = Vec::with_capacity(2);
+    let mut all_nodes = Vec::with_capacity(2);
+
+    for (i, inp) in inputs.iter().enumerate() {
+        let privkey = hex32_native(&inp.privkey_hex)?;
+        let blinding = hex32_native(&inp.blinding_hex)?;
         if inp.path_hex.len() != TX_LEVELS {
-            return Err(JsValue::from_str(&format!(
+            return Err(format!(
                 "input path must have {TX_LEVELS} siblings, got {}",
                 inp.path_hex.len()
-            )));
+            ));
         }
         let mut path = Vec::with_capacity(TX_LEVELS);
         for sib in &inp.path_hex {
-            path.push(hex32(sib)?);
+            path.push(hex32_native(sib)?);
         }
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
@@ -543,11 +769,33 @@ pub fn prove_transact(
         let nf = v3_nullifier(c, Fr::from(inp.leaf_index), sig);
         nullifiers.push(fr_to_le_bytes_32(nf));
 
+        // For non-zero-amount inputs, verify Merkle path folds to expected root.
+        let (nodes, computed_root) = fold_v3_path(c, inp.leaf_index, &path);
+        if inp.amount > 0 && computed_root != root_fr {
+            return Err(format!(
+                "input {i} Merkle path does not fold to expected root"
+            ));
+        }
+
         in_amounts.push(Some(inp.amount));
         in_privkeys.push(Some(privkey));
         in_blindings.push(Some(blinding));
         in_leaf_indices.push(Some(inp.leaf_index));
-        in_paths.push(Some(path));
+        in_paths.push(Some(path.clone()));
+        all_paths_raw.push(path);
+        all_nodes.push(nodes);
+    }
+
+    // 2-note spend consistency: both inputs have non-zero value
+    if inputs[0].amount > 0 && inputs[1].amount > 0 {
+        validate_v3_2note_merkle_consistency(
+            inputs[0].leaf_index,
+            inputs[1].leaf_index,
+            &all_paths_raw[0],
+            &all_paths_raw[1],
+            &all_nodes[0],
+            &all_nodes[1],
+        )?;
     }
 
     let mut out_amounts = Vec::new();
@@ -555,8 +803,8 @@ pub fn prove_transact(
     let mut out_blindings = Vec::new();
     let mut output_commitments = Vec::new();
     for outp in &outputs {
-        let pubkey = hex32(&outp.pubkey_hex)?;
-        let blinding = hex32(&outp.blinding_hex)?;
+        let pubkey = hex32_native(&outp.pubkey_hex)?;
+        let blinding = hex32_native(&outp.blinding_hex)?;
         let oc = v3_commit(
             Fr::from(outp.amount),
             Fr::from_le_bytes_mod_order(&pubkey),
@@ -603,15 +851,15 @@ pub fn prove_transact(
     };
 
     let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+        .map_err(|e| format!("bad proving key: {e}"))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
-            .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
+            .map_err(|e| format!("prove failed: {e}"))?;
 
     let mut proof_bytes = Vec::new();
     proof
         .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| JsValue::from_str(&format!("serialize failed: {e}")))?;
+        .map_err(|e| format!("serialize failed: {e}"))?;
 
     // The L2 carries `tag(1) || body`. Nodes split the envelope and reject an
     // unknown suite rather than assuming the one they happen to embed, so an
@@ -629,6 +877,28 @@ pub fn prove_transact(
         hex::encode(output_commitments[1]),
         hex::encode(wire)
     ))
+}
+
+#[wasm_bindgen]
+pub fn prove_transact(
+    proving_key: &[u8],
+    root_hex: &str,
+    ext_amount: i64,
+    recipient_hex: &str,
+    asset_id_hex: &str,
+    inputs_json: &str,
+    outputs_json: &str,
+) -> Result<String, JsValue> {
+    prove_transact_native(
+        proving_key,
+        root_hex,
+        ext_amount,
+        recipient_hex,
+        asset_id_hex,
+        inputs_json,
+        outputs_json,
+    )
+    .map_err(|e| JsValue::from_str(&e))
 }
 
 /// Rebuild the v3 on-chain tree from its ordered leaf list and return the
